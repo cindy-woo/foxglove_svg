@@ -5,14 +5,17 @@ the DTC *Robot Control Panel* that anchors the `foxglove_ws` basestation layout.
 One panel owns agent selection, the swarm-wide safety command, and the operator's
 health picture.
 
-It implements the two **Visual Insert Requirements** from the project brief:
+Three ideas drive the whole panel:
 
-| Requirement | Where it lands |
+| Idea | What it means |
 | --- | --- |
-| Multi-tiered topology, dual-link redundancy (Wi-Fi mesh → 5G/4G failover) | Topology diagram at the top of the CommLink section — the path actually carrying each agent's telemetry is solid and coloured by health, the standby path dashed |
-| Packet drop rate (<1%), end-to-end RTT (<20 ms), PTP drift, link health state transitions | CommLink metrics table + the transition log beneath it |
-| Per-agent SoC, voltage sag under high-rate maneuvers, dynamic remaining mission time | Battery & Power cards |
-| Automated RTB thresholds from distance-to-pad energy (>30% nominal, 20–30% gated, <20% failsafe) | RTB verdict chip, threshold ticks on each SoC bar, and the energy-margin row |
+| **Mode is wiring** | An agent is `sim` or `real`, exactly as in `swarm_commander`'s `drone_modes`. `sim` talks to the MAVROS interface (`/{name}/interface/...`); `real` talks to `px4_interface` over uXRCE-DDS (`/{name}/fmu/...`) and additionally carries mocap, EKF and timesync telemetry. The **Wiring** card spells out the resolved topics for the selected agent. |
+| **Topics decide what you see** | Every section declares the topics it needs. A section with no publisher is not rendered, so a sim-only run shows no empty mocap/EKF columns and a run with no cellular reporter shows no empty cellular table. The banner lists the tasks the panel inferred. |
+| **No fabricated numbers** | Anything with no source reads `--`. Every derived value is labelled with where it came from. |
+
+There is **no Wi-Fi mesh**. The transport model is the local Wi-Fi / LAN path used
+in the lab, plus a 4G/5G path carrying the same DDS traffic inside a Tailscale VPN
+for field work.
 
 ## Install
 
@@ -27,57 +30,89 @@ python3 gcs/foxglove_extensions/install.py     # installs airlab-cmu.svg-basesta
 alongside a 3D view of `/svg/viz/markers` and SoC / pack-voltage plots. Load it
 with **Layout → Import from file**.
 
-## Wiring
+## Safety stop
 
-Defaults match `robot/ros_ws/src/svg_ground_control` (`swarm_commander.py`); every
-one is editable in the panel settings.
+The red bar under the banner is the one control that must work without reading
+anything: it lands every commanded drone (`~/land`, which descends and disarms on
+touchdown). It takes **two clicks** — the first arms it for 4 s, the second fires
+— so it is fast under stress but an accidental brush cannot land the swarm. Next
+to it, **Hold All** (`~/hold`) is the softer stop: every drone freezes at its
+current position and the scenario stops.
 
-| Purpose | Default | Type |
+Takeoff / Start / Reset Fence stay in the ordinary command strip below.
+
+## Mode and wiring
+
+`Modes` in the settings takes a comma-separated `sim|real` list in `drone_names`
+order, mirroring `swarm_commander`'s `drone_modes`. Leave it blank and each agent
+is **detected from the topics on the wire**: anything publishing under
+`/{name}/fmu/` is real, anything under `/{name}/interface/` is sim. The Wiring
+card says which of the two happened.
+
+| Purpose | `sim` | `real` |
 | --- | --- | --- |
-| State (position, speed) | `/{name}/odometry_conversion/odometry` | `nav_msgs/Odometry` |
-| Primary link (Wi-Fi mesh) | `/{name}/odometry_conversion/odometry` | any stamped message |
-| Backup link (5G/4G) | `/{name}/cellular/odometry` | any stamped message |
-| Battery, hardware | `/{name}/fmu/out/battery_status` | `px4_msgs/BatteryStatus` |
-| Battery, sim | `/{name}/interface/mavros/battery` | `sensor_msgs/BatteryState` |
-| Link report (optional) | `/{name}/comms/link_status` | `std_msgs/String`, JSON |
-| Lifecycle | `/swarm_commander/{takeoff,start,hold,land,reset_fence}` | `std_srvs/Trigger` |
-| Formation | `/svg/formation_command` | `std_msgs/String` |
+| State | `/{name}/odometry_conversion/odometry` | same |
+| Velocity command | `/{name}/interface/velocity_command` | `/{name}/fmu/velocity_command` |
+| Robot command | `/{name}/interface/robot_command` | `/{name}/fmu/robot_command` |
+| Battery | `/{name}/interface/mavros/battery` (`sensor_msgs/BatteryState`) | `/{name}/fmu/out/battery_status` (`px4_msgs/BatteryStatus`) |
+| Mocap | — | `/{name}/pose` (`geometry_msgs/PoseStamped`) |
+| EKF | — | `/{name}/fmu/out/estimator_status_flags`, `/{name}/fmu/out/vehicle_local_position` |
+| Ping | — | `/{name}/fmu/out/timesync_status` (`px4_msgs/TimesyncStatus`) |
 
-Set **Roles** to a comma-separated `guard|strike` list, one per agent, in
-`drone_names` order — Guard is the defending swarm, Strike the intruding one.
+Both battery shapes are subscribed regardless of the resolved mode, so a wrong
+guess never blanks the power picture.
+
 **Position offsets** takes the same flat `x,y,z` per agent as
 `drone_position_offsets`, so real and simulated agents share one world frame for
 the distance-to-pad calculation.
 
-## How the link metrics are derived
+## Link Safety
 
-No extra ROS node is required: everything comes from the arrival statistics of
-the telemetry already on the wire.
+| Column | Where the number comes from |
+| --- | --- |
+| **Path** | Which transport is live: Wi-Fi / LAN, or the 4G/5G VPN |
+| **Rate** | Median inter-arrival of the telemetry on that path |
+| **Ping** | Best available source, labelled in the cell: an explicit link report, then PX4's uXRCE-DDS `timesync_status.round_trip_time` (a genuinely measured RTT), then the Tailscale reporter when the VPN is the live path, then `2 × mean(rx − header.stamp)` |
+| **Drop** | Nominal publish period `P` is the median inter-arrival gap; a gap of `k·P` counts as `k−1` missed of `k` expected, over a 10 s window. Gaps past the 1 s loss timeout are outages, not loss — they are reported as state transitions instead |
+| **Mocap age** | `rx − header.stamp` of `/{name}/pose`: the delay of the state estimate PX4 is fusing, annotated with the mocap rate. Goes to `LOST` with a silence duration once nothing arrives inside the mocap timeout |
+| **EKF** | `EV FUSED` when EKF2 is fusing external vision (`cs_ev_pos/_yaw/_hgt`), `NO VISION` when a real agent is not, `DEAD RECK` on `cs_inertial_dead_reckoning` / `cs_fake_pos`, `NO POSITION` when `xy_valid`/`z_valid` clear. Hover for the flag detail |
+| **Clock drift** | Least-squares slope of the per-second minima of `rx − header.stamp` over 120 s, or PX4's own `estimated_offset`. A ramping floor means the clocks are separating — read the derived Ping against it |
 
-- **Drop rate** — the nominal publish period is the median inter-arrival gap; a
-  gap of *k* periods counts as *k−1* missed samples out of *k* expected, over a
-  10 s window. Gaps longer than the 1 s loss timeout are outages rather than
-  packet loss, so they are excluded here and reported as a state transition
-  instead.
-- **RTT** — twice the mean one-way delay, where the one-way delay is
-  `receive_time − header.stamp`. That identity holds exactly while PTP keeps the
-  publisher and the GCS on one timebase.
-- **PTP sync floor / drift** — the per-second minima of that same offset are the
-  residual clock error plus minimum transit time. The least-squares slope of the
-  floor over 120 s is the drift rate; a ramping floor means the clocks are
-  separating, and the RTT column should be read against it.
+**Link health**: `LOST` when neither path has been heard from inside the loss
+timeout; `DEGRADED` when drop rate or ping is out of spec (ping is graded against
+the LAN target on the LAN and the VPN target on the VPN); `ON VPN` when the LAN is
+silent but the cellular path is live and in spec; otherwise `HEALTHY`. Every
+change is timestamped in the transition log.
 
-If a deployment publishes a real link report on the link-status topic, any of
-`drop_rate`, `rtt_ms`, `ptp_offset_ms`, `ptp_drift_ms` and `active_tier` present
-in that JSON override the derived values. Anything with no source reads `--`
-rather than showing a fabricated number.
+An optional `/{name}/comms/link_status` report (`std_msgs/String`, JSON) overrides
+any of `drop_rate`, `rtt_ms`, `clock_offset_ms`, `clock_drift_ms`, `active_tier`.
+A report older than 10 s stops overriding, so a dead reporter cannot pin the panel
+to its last-known-good numbers.
 
-**Link health**: `LOST` when neither tier has been heard from inside the loss
-timeout; `DEGRADED` when drop rate or RTT is out of spec; `FAILOVER` when the
-mesh is silent but the cellular path is live and in spec; otherwise `HEALTHY`.
-Every change is timestamped in the transition log.
+## Cellular · Tailscale VPN
 
-## How the power picture is derived
+Shown when a cellular reporter or a VPN-path topic exists. Per agent: network
+tier, VPN ping, Tailscale path, signal, interface and report age.
+
+Have each agent (or a GCS-side prober) publish JSON on `/{name}/comms/cellular`
+(`std_msgs/String`) with any of:
+
+```json
+{
+  "tier": "5G",
+  "rtt_ms": 78.4,
+  "state": "direct",
+  "rsrp_dbm": -96,
+  "interface": "wwan0"
+}
+```
+
+`state: "relay"` means Tailscale could not hole-punch and is bouncing through a
+DERP server — the extra hop is the latency you are looking at, and the column
+flags it amber. With no reporter running, VPN ping falls back to the arrival
+statistics of whatever DDS traffic is on `/{name}/cellular/odometry`.
+
+## Battery & Power
 
 - **SoC / voltage / draw** come straight from the battery message; the SoC bar
   carries ticks at the two RTB thresholds.
@@ -90,4 +125,23 @@ Every change is timestamped in the transition log.
 - **Return budget** is the distance-to-pad energy: cruise home at the configured
   speed, descend at the land speed, priced at the measured burn rate, plus a
   reserve. `RTB NOW` fires when SoC falls to that budget — ahead of the fixed
-  percentage gates, which still apply independently.
+  percentage gates (>30% nominal, 20–30% gated, <20% failsafe), which still apply
+  independently.
+
+## Section visibility
+
+`Sections` is `Auto` by default: a section is hidden when nothing publishes what
+it needs. Set it to `Show all` to force everything on. Before any topic list has
+arrived — a fresh connection, or a data source that does not advertise topics —
+everything is shown, because an empty panel is a worse failure than a full one.
+
+The banner's **Tasks** chip lists what the panel inferred, so it is always clear
+why a section is or is not there:
+
+| Task | Detected from |
+| --- | --- |
+| goal-tracking | `/svg/{name}/goal_command` |
+| formation | `/svg/formation_command` |
+| teleop | `/svg/{name}/teleop_command` |
+| mocap/hardware | `/{name}/pose`, `/{name}/fmu/out/estimator_status_flags` |
+| cellular | `/{name}/comms/cellular`, `/{name}/cellular/odometry` |

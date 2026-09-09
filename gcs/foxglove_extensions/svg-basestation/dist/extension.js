@@ -3,52 +3,55 @@
 
 // ─────────────────────────── SVG Basestation ──────────────────────────────────
 //
-// Ground-station panel for the SVG counter-UAS demonstration (Guard swarm vs.
-// Strike swarm, see the project description). It is the SVG analogue of the
-// DTC "Robot Control Panel" that anchors the foxglove_ws basestation layout:
-// one panel that owns agent selection, the swarm-wide safety command, and the
-// operator's health picture.
+// Ground-station panel for the SVG counter-UAS demonstration. It is the SVG
+// analogue of the DTC "Robot Control Panel" that anchors the foxglove_ws
+// basestation layout: one panel that owns agent selection, the swarm-wide
+// safety command, and the operator's health picture.
 //
-// It implements the two "Visual Insert Requirements" from the project brief:
+// Three things drive the whole panel:
 //
-//   1. CommLink Robustness Architecture
-//      - multi-tiered topology showing dual-link redundancy: primary Wi-Fi
-//        mesh with failover to 5G/4G cellular transport for DDS telemetry
-//      - packet drop rate (<1% target), end-to-end RTT (<20 ms target),
-//        PTP clock synchronization drift, link health state transitions
+//   1. MODE (sim | real) is the agent's *wiring*, mirroring swarm_commander's
+//      drone_modes parameter. "sim" routes through the MAVROS interface
+//      (/{name}/interface/...); "real" routes through px4_interface over
+//      uXRCE-DDS (/{name}/fmu/...) and additionally carries mocap + EKF
+//      telemetry. Mode is auto-detected from the topics actually on the wire
+//      and can be pinned per agent in the settings.
 //
-//   2. Battery & Power Management Telemetry
-//      - per-agent SoC, operational voltage sag during high-rate maneuvers,
-//        dynamic remaining mission time
-//      - automated RTB thresholds from distance-to-pad energy calculations
-//        (nominal >30%, conservative maneuver gating 20-30%, mandatory
-//        failsafe landing <20%)
+//   2. TOPIC DISCOVERY drives visibility. Every section declares which topics
+//      it needs; a section that has no source is not rendered at all, so a
+//      sim-only run does not show empty mocap/EKF columns and a run with no
+//      cellular reporter does not show an empty cellular table. The detected
+//      task set (goal / formation / teleop / mocap) is shown in the banner so
+//      the operator can see what the panel decided.
 //
-// Wiring matches robot/ros_ws/src/svg_ground_control (swarm_commander.py):
-//   state     /{name}/odometry_conversion/odometry      nav_msgs/Odometry
-//   battery   /{name}/fmu/out/battery_status            px4_msgs/BatteryStatus   (real)
-//             /{name}/interface/mavros/battery          sensor_msgs/BatteryState (sim)
+//   3. Anything with no source reads "--" rather than a fabricated number.
+//
+// Transport model: there is no Wi-Fi mesh. Each agent is reachable over the
+// local Wi-Fi / LAN (the DDS path used in the lab) and, in the field, over
+// 4G/5G with a Tailscale VPN carrying the same traffic. Both paths are drawn
+// in the topology; only the ones actually provisioned are shown live.
+//
+// Wiring matches robot/ros_ws/src/svg_ground_control (swarm_commander.py,
+// mocap_bridge.py):
+//   state     /{name}/odometry_conversion/odometry       nav_msgs/Odometry
+//   battery   /{name}/fmu/out/battery_status             px4_msgs/BatteryStatus   (real)
+//             /{name}/interface/mavros/battery           sensor_msgs/BatteryState (sim)
+//   mocap     /{name}/pose                               geometry_msgs/PoseStamped (real)
+//   ekf       /{name}/fmu/out/estimator_status_flags     px4_msgs/EstimatorStatusFlags
+//             /{name}/fmu/out/vehicle_local_position     px4_msgs/VehicleLocalPosition
+//   ping      /{name}/fmu/out/timesync_status            px4_msgs/TimesyncStatus
+//   cellular  /{name}/comms/cellular                     std_msgs/String, JSON
 //   lifecycle /swarm_commander/{takeoff,start,hold,land,reset_fence}  std_srvs/Trigger
-//   formation /svg/formation_command                    std_msgs/String
-//
-// Every link metric is DERIVED from the arrival statistics of the telemetry
-// itself (no extra ROS node required); if a deployment publishes a real link
-// report on {linkStatusTopicTemplate} (std_msgs/String JSON with any of
-// drop_rate / rtt_ms / ptp_drift_ms / active_tier) those values override the
-// derived ones. Fields with no source read "--" rather than showing a
-// fabricated number.
+//   formation /svg/formation_command                     std_msgs/String
 
 // ─────────────────────────── constants ────────────────────────────────────────
 
+// Normal-operations commands. Stopping the swarm lives in the safety bar.
 const LIFECYCLE = [
   { id: "takeoff",     label: "Takeoff",     color: "#2563eb", confirm: true,
     hint: "Arm + offboard, ascend everyone to the scenario's initial positions, then HOLD" },
   { id: "start",       label: "Start",       color: "#10b981", confirm: true,
     hint: "Begin the scenario — nominal policies go live" },
-  { id: "hold",        label: "HOLD ALL",    color: "#f59e0b", confirm: false,
-    hint: "Panic button: every drone freezes at its current position" },
-  { id: "land",        label: "Land All",    color: "#dc2626", confirm: true,
-    hint: "Descend all commanded drones, disarm on touchdown" },
   { id: "reset_fence", label: "Reset Fence", color: "#6b7280", confirm: false,
     hint: "Clear a latched geofence breach" },
 ];
@@ -56,10 +59,20 @@ const LIFECYCLE = [
 // Link health states, worst last — the swarm banner reports the worst one.
 const LINK_STATE = {
   HEALTHY:  { rank: 0, label: "HEALTHY",  color: "#10b981" },
-  FAILOVER: { rank: 1, label: "FAILOVER", color: "#3b82f6" },
+  FAILOVER: { rank: 1, label: "ON VPN",   color: "#3b82f6" },
   DEGRADED: { rank: 2, label: "DEGRADED", color: "#f59e0b" },
   LOST:     { rank: 3, label: "LOST",     color: "#dc2626" },
   NO_DATA:  { rank: 4, label: "NO DATA",  color: "#6b7280" },
+};
+
+// EKF / state-estimate verdicts, worst last.
+const EKF_STATE = {
+  EV_FUSED: { rank: 0, label: "EV FUSED", color: "#10b981" },
+  VALID:    { rank: 1, label: "VALID",    color: "#10b981" },
+  NO_EV:    { rank: 2, label: "NO VISION", color: "#f59e0b" },
+  DEAD_REC: { rank: 3, label: "DEAD RECK", color: "#dc2626" },
+  NO_POS:   { rank: 4, label: "NO POSITION", color: "#dc2626" },
+  NO_DATA:  { rank: 5, label: "NO DATA",  color: "#6b7280" },
 };
 
 // RTB verdicts, worst last.
@@ -71,32 +84,72 @@ const RTB_STATE = {
   NO_DATA:  { rank: 4, label: "NO DATA",       color: "#6b7280" },
 };
 
+// Transport tiers. No mesh: the lab path is plain Wi-Fi/LAN, the field path is
+// 4G/5G carrying the same DDS traffic inside a Tailscale VPN.
 const TIERS = [
-  { id: "primary", label: "Wi-Fi Mesh",      sub: "primary DDS transport" },
-  { id: "backup",  label: "5G / 4G Cellular", sub: "failover DDS transport" },
+  { id: "lan", label: "Local Wi-Fi / LAN", sub: "primary DDS transport" },
+  { id: "vpn", label: "4G / 5G · Tailscale", sub: "VPN transport" },
 ];
 
-const METRIC_WINDOW_S = 10;    // sliding window for drop rate / RTT
-const PTP_WINDOW_S = 120;      // sliding window for clock-offset drift slope
+const MODES = {
+  sim:  { id: "sim",  label: "SIM",  color: "#2563eb" },
+  real: { id: "real", label: "REAL", color: "#b45309" },
+};
+
+const METRIC_WINDOW_S = 10;     // sliding window for drop rate / derived RTT
+const CLOCK_WINDOW_S = 120;     // sliding window for clock-offset drift slope
 const LINK_LOSS_TIMEOUT_S = 1.0;
 const MAX_TRANSITIONS = 60;
-const SOC_SLOPE_WINDOW_S = 60; // sliding window for the burn-rate estimate
+const SOC_SLOPE_WINDOW_S = 60;  // sliding window for the burn-rate estimate
+const STALE_REPORT_S = 10;      // JSON reports older than this stop overriding
 const UI_REFRESH_MS = 200;
+const SAFETY_ARM_S = 4;         // safety button stays armed this long
 
 // ─────────────────────────── defaults ─────────────────────────────────────────
 
 const DEFAULTS = {
   drones: "drone_1,drone_2,drone_3",
-  // Guard = defending swarm, Strike = intruding swarm (project scenarios A1/A2/C).
-  roles: "guard,guard,strike",
+  // Wiring per agent, mirroring swarm_commander's drone_modes. Blank = detect
+  // each agent from the topics on the wire.
+  modes: "",
   commanderNs: "/swarm_commander",
   formationTopic: "/svg/formation_command",
+
+  // shared
   stateTopicTemplate: "/{name}/odometry_conversion/odometry",
-  primaryTopicTemplate: "/{name}/odometry_conversion/odometry",
-  backupTopicTemplate: "/{name}/cellular/odometry",
-  batteryTopicTemplate: "/{name}/fmu/out/battery_status",
-  batteryAltTopicTemplate: "/{name}/interface/mavros/battery",
+
+  // sim wiring (MAVROS interface)
+  simBatteryTopicTemplate: "/{name}/interface/mavros/battery",
+  simCommandTopicTemplate: "/{name}/interface/velocity_command",
+  simRobotCommandTemplate: "/{name}/interface/robot_command",
+
+  // real wiring (px4_interface / uXRCE-DDS)
+  realBatteryTopicTemplate: "/{name}/fmu/out/battery_status",
+  realCommandTopicTemplate: "/{name}/fmu/velocity_command",
+  realRobotCommandTemplate: "/{name}/fmu/robot_command",
+  mocapTopicTemplate: "/{name}/pose",
+  ekfFlagsTopicTemplate: "/{name}/fmu/out/estimator_status_flags",
+  localPositionTopicTemplate: "/{name}/fmu/out/vehicle_local_position",
+  timesyncTopicTemplate: "/{name}/fmu/out/timesync_status",
+
+  // transports
+  lanTopicTemplate: "/{name}/odometry_conversion/odometry",
+  vpnTopicTemplate: "/{name}/cellular/odometry",
+  cellularTopicTemplate: "/{name}/comms/cellular",
   linkStatusTopicTemplate: "/{name}/comms/link_status",
+
+  // task detection only (the panel never publishes these)
+  teleopTopicTemplate: "/svg/{name}/teleop_command",
+  goalTopicTemplate: "/svg/{name}/goal_command",
+
+  // link-safety targets
+  pingTargetMs: 20,
+  dropTargetPct: 1.0,
+  mocapAgeTargetMs: 60,
+  mocapTimeoutS: 0.5,
+  vpnPingTargetMs: 120,
+
+  // power / RTB
   padPosition: "0,0,0",
   positionOffsets: "",
   cruiseSpeedMps: 1.0,
@@ -104,14 +157,19 @@ const DEFAULTS = {
   reservePct: 8,
   rtbNominalPct: 30,
   rtbGatedPct: 20,
-  dropTargetPct: 1.0,
-  rttTargetMs: 20,
+
+  // "auto" hides sections with no topic source; "all" forces everything on.
+  sections: "auto",
 };
 
 // ─────────────────────────── helpers ──────────────────────────────────────────
 
 function splitList(s) {
   return String(s ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+}
+
+function tpl(template, name) {
+  return template ? String(template).replace("{name}", name) : null;
 }
 
 function toSec(t) {
@@ -136,7 +194,7 @@ function median(arr) {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
-// Least-squares slope of y over x (used for PTP drift and SoC burn rate).
+// Least-squares slope of y over x (used for clock drift and SoC burn rate).
 // x is centred first: these are epoch seconds (~1.7e9) and the uncentred normal
 // equations lose the whole signal to float64 cancellation.
 function slope(xs, ys) {
@@ -184,25 +242,30 @@ function parseVec3(s, fallback) {
   return p;
 }
 
-// ─────────────────────────── link statistics ──────────────────────────────────
+// A JSON report only overrides derived values while it is fresh — a reporter
+// that died must not pin the panel to its last-known-good numbers forever.
+function freshReport(report, at, now) {
+  return report != null && at != null && now - at <= STALE_REPORT_S ? report : null;
+}
+
+// ─────────────────────────── stream statistics ────────────────────────────────
 //
-// One instance per (agent, transport tier). Everything is derived from the
-// arrival pattern of the DDS telemetry carried on that tier:
+// One instance per (agent, stream). Everything is derived from the arrival
+// pattern of the messages themselves:
 //
 //   drop rate  — the nominal publish period P is the median inter-arrival gap;
 //                a gap of k*P is counted as k-1 missed samples out of k expected.
 //                Gaps longer than the loss timeout are outages, not loss, and
 //                are excluded (the state machine reports those instead).
-//   RTT        — 2 x the mean one-way delay, where the one-way delay is
-//                rx_time - header.stamp. That identity holds exactly while PTP
-//                keeps the publisher and the GCS on one timebase.
-//   PTP drift  — the per-second minima of that same offset form the sync floor:
-//                the residual clock error plus the minimum transit time. Its
-//                least-squares slope over PTP_WINDOW_S is the drift rate, and a
-//                ramping floor is the signal that the clocks are separating (so
-//                the RTT above should be read against it).
+//   age        — rx_time - header.stamp: the one-way delay of the newest sample.
+//                For the mocap stream this is exactly the "how stale is the
+//                state estimate PX4 is fusing" number.
+//   derived RTT— 2 x the mean of that offset. The identity holds only while the
+//                publisher and the GCS share a timebase, which the clock-drift
+//                column is there to falsify; a measured ping (PX4 timesync or
+//                the Tailscale reporter) always wins over it.
 
-function newTierStats(topic) {
+function newStream(topic) {
   return {
     topic,
     lastRx: null,
@@ -214,7 +277,7 @@ function newTierStats(topic) {
   };
 }
 
-function tierOnMessage(st, rxSec, stampSec) {
+function streamOnMessage(st, rxSec, stampSec) {
   st.everSeen = true;
   if (st.lastRx != null) {
     const dt = rxSec - st.lastRx;
@@ -230,16 +293,16 @@ function tierOnMessage(st, rxSec, stampSec) {
         st.gaps.push([rxSec, expected, expected - 1]);
       }
       // A gap longer than the loss timeout is an outage, not packet loss: it is
-      // already reported as LOST/FAILOVER and logged as a state transition, so
-      // it is deliberately left out of the drop-rate window.
+      // already reported as LOST/ON VPN and logged as a state transition, so it
+      // is deliberately left out of the drop-rate window.
     }
   }
   st.lastRx = rxSec;
   if (stampSec != null) st.offsets.push([rxSec, rxSec - stampSec]);
   // Prune by age, not by sample count — a count cap would silently shorten the
-  // PTP window on a fast topic.
+  // clock window on a fast topic.
   prune(st.gaps, rxSec - METRIC_WINDOW_S * 2);
-  prune(st.offsets, rxSec - PTP_WINDOW_S * 1.5);
+  prune(st.offsets, rxSec - CLOCK_WINDOW_S * 1.5);
 }
 
 // Drop leading entries older than `cutoff` from an ascending [t, ...] list.
@@ -249,7 +312,15 @@ function prune(list, cutoff) {
   if (i > 0) list.splice(0, i);
 }
 
-function tierDropRatePct(st, now) {
+function streamFresh(st, now, timeout) {
+  return st.lastRx != null && now - st.lastRx <= (timeout ?? LINK_LOSS_TIMEOUT_S);
+}
+
+function streamRateHz(st) {
+  return st.period ? 1 / st.period : null;
+}
+
+function streamDropRatePct(st, now) {
   const cutoff = now - METRIC_WINDOW_S;
   let expected = 0, missed = 0;
   for (let i = st.gaps.length - 1; i >= 0; i--) {
@@ -261,11 +332,14 @@ function tierDropRatePct(st, now) {
   return (missed / expected) * 100;
 }
 
-// End-to-end RTT = 2 x the mean one-way delay. With PTP holding the publisher
-// and the GCS on the same timebase, (rx - header.stamp) *is* the one-way delay;
-// the sync floor reported below is what tells the operator whether that
-// assumption still holds.
-function tierRttMs(st, now) {
+// Age of the newest sample, in ms: how far behind wall time the data is.
+function streamAgeMs(st) {
+  if (!st.offsets.length) return null;
+  return st.offsets[st.offsets.length - 1][1] * 1000;
+}
+
+// Fallback ping when nothing measured one: 2 x the mean one-way delay.
+function streamDerivedRttMs(st, now) {
   const cutoff = now - METRIC_WINDOW_S;
   const win = [];
   for (let i = st.offsets.length - 1; i >= 0; i--) {
@@ -277,9 +351,9 @@ function tierRttMs(st, now) {
   return Math.max(0, mean * 2 * 1000);
 }
 
-// Returns { offsetMs, driftMsPerMin } — the PTP clock-sync error and its rate.
-function tierPtp(st, now) {
-  const cutoff = now - PTP_WINDOW_S;
+// Returns { offsetMs, driftMsPerMin } — the clock-sync error and its rate.
+function streamClock(st, now) {
+  const cutoff = now - CLOCK_WINDOW_S;
   const xs = [], ys = [];
   for (let i = st.offsets.length - 1; i >= 0; i--) {
     if (st.offsets[i][0] < cutoff) break;
@@ -295,16 +369,16 @@ function tierPtp(st, now) {
     if (prev == null || ys[i] < prev) buckets.set(k, ys[i]);
   }
   const keys = [...buckets.keys()].sort((a, b) => a - b);
-  const bx = keys, by = keys.map((k) => buckets.get(k));
+  const by = keys.map((k) => buckets.get(k));
   const offsetMs = by[by.length - 1] * 1000;
-  const s = slope(bx, by);
+  const s = slope(keys, by);
   return { offsetMs, driftMsPerMin: s == null ? null : s * 60 * 1000 };
 }
 
 // ─────────────────────────── battery normalisation ────────────────────────────
 //
-// Accepts px4_msgs/BatteryStatus (hardware, uXRCE-DDS) or
-// sensor_msgs/BatteryState (sim, MAVROS) and flattens them to one shape.
+// Accepts px4_msgs/BatteryStatus (real, uXRCE-DDS) or sensor_msgs/BatteryState
+// (sim, MAVROS) and flattens them to one shape.
 
 function normaliseBattery(msg) {
   if (msg == null || typeof msg !== "object") return null;
@@ -347,25 +421,29 @@ function normaliseBattery(msg) {
 
 // ─────────────────────────── per-agent runtime ────────────────────────────────
 
-function newAgent(name, role, cfg) {
+function newAgent(name) {
   return {
     name,
-    role,                       // "guard" | "strike"
-    tiers: {
-      primary: newTierStats(cfg.primaryTopicTemplate.replace("{name}", name)),
-      backup: newTierStats(cfg.backupTopicTemplate.replace("{name}", name)),
-    },
-    reported: null,             // last decoded {linkStatusTopicTemplate} report
+    mode: "sim",                // resolved wiring: "sim" | "real"
+    modeSource: "default",      // "config" | "detected" | "default"
+    tiers: { lan: newStream(null), vpn: newStream(null) },
+    mocap: newStream(null),
+    reported: null,             // {linkStatusTopicTemplate} JSON
     reportedAt: null,
+    cellular: null,             // {cellularTopicTemplate} JSON
+    cellularAt: null,
     linkState: LINK_STATE.NO_DATA,
     linkSince: null,
     activeTier: null,
     transitions: [],            // [{t, from, to, tier}]
-    // motion
+    // state estimate
     offset: [0, 0, 0],          // drone_position_offsets entry, added to odometry
     pos: null,                  // [x, y, z] world ENU
     speed: null,
     posAt: null,
+    ekfFlags: null, ekfAt: null,
+    localPos: null, localPosAt: null,
+    timesync: null, timesyncAt: null,
     // battery
     batt: null,
     battAt: null,
@@ -385,51 +463,130 @@ function noteLinkState(agent, next, tier, now) {
   agent.linkSince = now;
 }
 
-// Fold derived + reported link data into the agent's health state.
+// Fold measured + derived + reported link data into the agent's health state.
 function evaluateLink(agent, cfg, now) {
-  const r = agent.reported;
-  const primary = agent.tiers.primary;
-  const backup = agent.tiers.backup;
+  const r = freshReport(agent.reported, agent.reportedAt, now);
+  const cell = freshReport(agent.cellular, agent.cellularAt, now);
+  const lan = agent.tiers.lan;
+  const vpn = agent.tiers.vpn;
 
-  const freshP = primary.lastRx != null && now - primary.lastRx <= LINK_LOSS_TIMEOUT_S;
-  const freshB = backup.lastRx != null && now - backup.lastRx <= LINK_LOSS_TIMEOUT_S;
+  const freshLan = streamFresh(lan, now);
+  const freshVpn = streamFresh(vpn, now);
 
-  let tier = r?.active_tier ?? (freshP ? "primary" : freshB ? "backup" : null);
-  if (tier !== "primary" && tier !== "backup") tier = freshP ? "primary" : freshB ? "backup" : null;
+  let tier = r?.active_tier ?? (freshLan ? "lan" : freshVpn ? "vpn" : null);
+  if (tier !== "lan" && tier !== "vpn") tier = freshLan ? "lan" : freshVpn ? "vpn" : null;
   agent.activeTier = tier;
 
-  const st = tier ? agent.tiers[tier] : primary;
-  const derivedDrop = tierDropRatePct(st, now);
-  const derivedRtt = tierRttMs(st, now);
-  const ptp = tierPtp(st, now);
+  const st = tier ? agent.tiers[tier] : lan;
+  const clock = streamClock(st, now);
+
+  // Ping, best source first: an explicit link report, then PX4's own
+  // uXRCE-DDS timesync round-trip (a genuinely measured RTT), then the
+  // Tailscale reporter when the VPN is the live path, then the arrival-time
+  // estimate. The source is surfaced so the operator knows which they got.
+  let pingMs = null, pingSource = null;
+  const reportedPing = num(r?.rtt_ms);
+  const timesyncRtt = agent.timesync != null && num(agent.timesync.round_trip_time) != null
+    ? Number(agent.timesync.round_trip_time) / 1000 : null;
+  const cellPing = num(cell?.rtt_ms);
+  if (reportedPing != null) { pingMs = reportedPing; pingSource = "report"; }
+  else if (timesyncRtt != null && timesyncRtt > 0) { pingMs = timesyncRtt; pingSource = "timesync"; }
+  else if (tier === "vpn" && cellPing != null) { pingMs = cellPing; pingSource = "tailscale"; }
+  else {
+    const derived = streamDerivedRttMs(st, now);
+    if (derived != null) { pingMs = derived; pingSource = "derived"; }
+  }
+
+  // Clock offset: PX4's timesync estimate is authoritative when present.
+  const timesyncOffsetMs = agent.timesync != null && num(agent.timesync.estimated_offset) != null
+    ? Number(agent.timesync.estimated_offset) / 1000 : null;
 
   agent.metrics = {
-    dropPct: num(r?.drop_rate) != null ? Number(r.drop_rate) : derivedDrop,
-    rttMs: num(r?.rtt_ms) != null ? Number(r.rtt_ms) : derivedRtt,
-    ptpOffsetMs: num(r?.ptp_offset_ms) != null ? Number(r.ptp_offset_ms) : ptp.offsetMs,
-    ptpDriftMsPerMin: num(r?.ptp_drift_ms) != null ? Number(r.ptp_drift_ms) : ptp.driftMsPerMin,
-    primaryFresh: freshP,
-    backupFresh: freshB,
-    backupProvisioned: backup.everSeen,
-    rateHz: st.period ? 1 / st.period : null,
+    dropPct: num(r?.drop_rate) != null ? Number(r.drop_rate) : streamDropRatePct(st, now),
+    pingMs, pingSource,
+    clockOffsetMs: timesyncOffsetMs != null ? timesyncOffsetMs
+      : num(r?.clock_offset_ms) != null ? Number(r.clock_offset_ms) : clock.offsetMs,
+    clockDriftMsPerMin: num(r?.clock_drift_ms) != null ? Number(r.clock_drift_ms)
+      : clock.driftMsPerMin,
+    lanFresh: freshLan,
+    vpnFresh: freshVpn,
+    vpnProvisioned: vpn.everSeen,
+    rateHz: streamRateHz(st),
+    stateAgeMs: streamAgeMs(st),
   };
 
   let next;
-  if (!primary.everSeen && !backup.everSeen) {
+  if (!lan.everSeen && !vpn.everSeen) {
     next = LINK_STATE.NO_DATA;
-  } else if (!freshP && !freshB) {
+  } else if (!freshLan && !freshVpn) {
     next = LINK_STATE.LOST;
   } else {
     const m = agent.metrics;
-    const badDrop = m.dropPct != null && m.dropPct > cfg.dropTargetPct;
-    const badRtt = m.rttMs != null && m.rttMs > cfg.rttTargetMs;
+    const badDrop = m.dropPct != null && m.dropPct > Number(cfg.dropTargetPct);
+    // On the VPN path the acceptable ping is the (looser) cellular target.
+    const pingTarget = tier === "vpn" ? Number(cfg.vpnPingTargetMs) : Number(cfg.pingTargetMs);
+    const badPing = m.pingMs != null && m.pingMs > pingTarget;
     // Quality outranks routing: a link that failed over AND is out of spec is
     // reported as DEGRADED, with the tier column showing which path it took.
-    next = badDrop || badRtt ? LINK_STATE.DEGRADED
-      : !freshP && freshB ? LINK_STATE.FAILOVER
+    next = badDrop || badPing ? LINK_STATE.DEGRADED
+      : !freshLan && freshVpn ? LINK_STATE.FAILOVER
       : LINK_STATE.HEALTHY;
   }
   noteLinkState(agent, next, tier, now);
+}
+
+// Mocap freshness + PX4 EKF fusion state → one state-estimate verdict.
+//
+// This is the indoor arm-blocker made visible: with no GPS, PX4 only holds
+// position while EKF2 is fusing the mocap stream as external vision. A mocap
+// dropout shows up here (stale mocap, then cs_ev_pos clearing, then dead
+// reckoning) long before the drone visibly drifts.
+function evaluateEstimate(agent, cfg, now) {
+  const mocapTimeout = Math.max(0.05, Number(cfg.mocapTimeoutS) || 0.5);
+  const mocap = agent.mocap;
+  const est = {
+    mocapSeen: mocap.everSeen,
+    mocapFresh: streamFresh(mocap, now, mocapTimeout),
+    mocapAgeMs: streamAgeMs(mocap),
+    mocapRateHz: streamRateHz(mocap),
+    mocapSilentS: mocap.lastRx == null ? null : now - mocap.lastRx,
+    detail: [],
+  };
+
+  const f = agent.ekfFlags;
+  const lp = agent.localPos;
+  const fEV = f ? Boolean(f.cs_ev_pos || f.cs_ev_hgt || f.cs_ev_vel) : null;
+
+  if (f == null && lp == null) {
+    est.state = EKF_STATE.NO_DATA;
+  } else if (lp != null && (lp.xy_valid === false || lp.z_valid === false)) {
+    est.state = EKF_STATE.NO_POS;
+  } else if (f != null && (f.cs_fake_pos || f.cs_inertial_dead_reckoning)) {
+    est.state = EKF_STATE.DEAD_REC;
+  } else if (f != null && fEV === false && agent.mode === "real") {
+    // Real drone flying indoors with no external-vision fusion: it is on
+    // whatever else EKF2 found, which indoors is nothing good.
+    est.state = EKF_STATE.NO_EV;
+  } else if (fEV) {
+    est.state = EKF_STATE.EV_FUSED;
+  } else {
+    est.state = EKF_STATE.VALID;
+  }
+
+  if (f) {
+    if (f.cs_ev_pos) est.detail.push("ev-pos");
+    if (f.cs_ev_yaw) est.detail.push("ev-yaw");
+    if (f.cs_ev_hgt) est.detail.push("ev-hgt");
+    if (f.cs_gps) est.detail.push("gps");
+    if (f.cs_inertial_dead_reckoning) est.detail.push("dead-reckoning");
+    if (f.cs_fake_pos) est.detail.push("fake-pos");
+  }
+  if (lp) {
+    est.detail.push(`xy ${lp.xy_valid ? "ok" : "BAD"}`);
+    est.detail.push(`z ${lp.z_valid ? "ok" : "BAD"}`);
+    if (lp.heading_good_for_control === false) est.detail.push("heading BAD");
+  }
+  agent.estimate = est;
 }
 
 // Battery + distance-to-pad energy budget → RTB verdict.
@@ -496,6 +653,10 @@ function evaluatePower(agent, cfg, now) {
 // both the light and dark studio themes.
 
 const STYLES = `
+/* Section visibility is driven by the hidden property, and the author display
+   rules below would otherwise beat the user-agent [hidden] rule. */
+[hidden] { display: none !important; }
+
 .sb-root {
   font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-size: 12px; color: inherit; height: 100%; box-sizing: border-box;
@@ -523,6 +684,23 @@ const STYLES = `
 .sb-chip.sb-quiet { background: transparent; border: 1px solid rgba(127,127,127,0.4); color: inherit; font-weight: 600; }
 .sb-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 
+/* safety bar */
+.sb-safety { display: flex; gap: 8px; align-items: stretch; }
+.sb-safety-stop {
+  flex: 1; padding: 13px 14px; border: 2px solid #7f1d1d; border-radius: 6px;
+  background: #dc2626; color: #fff; cursor: pointer;
+  font-size: 14px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase;
+}
+.sb-safety-stop.sb-armed { background: #7f1d1d; border-color: #fca5a5; animation: sb-pulse 0.7s ease-in-out infinite alternate; }
+.sb-safety-stop:disabled { background: #6b7280; border-color: rgba(127,127,127,0.5); cursor: not-allowed; opacity: 0.7; }
+@keyframes sb-pulse { from { box-shadow: 0 0 0 0 rgba(220,38,38,0.75); } to { box-shadow: 0 0 0 7px rgba(220,38,38,0); } }
+.sb-safety-hold {
+  padding: 13px 16px; border: 2px solid rgba(245,158,11,0.7); border-radius: 6px;
+  background: #f59e0b; color: #1f2937; cursor: pointer;
+  font-size: 13px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase;
+}
+.sb-safety-hold:disabled { opacity: 0.55; cursor: not-allowed; }
+
 /* command strip */
 .sb-cmd-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .sb-btn {
@@ -538,8 +716,8 @@ const STYLES = `
 .sb-status { font-family: ui-monospace, monospace; font-size: 11px; opacity: 0.8; min-height: 14px; }
 
 /* layout */
-.sb-columns { display: grid; grid-template-columns: minmax(180px, 220px) minmax(0, 1fr); gap: 8px; align-items: start; }
-@media (max-width: 640px) { .sb-columns { grid-template-columns: 1fr; } }
+.sb-columns { display: grid; grid-template-columns: minmax(190px, 240px) minmax(0, 1fr); gap: 8px; align-items: start; }
+@media (max-width: 680px) { .sb-columns { grid-template-columns: 1fr; } }
 .sb-col { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
 
 /* roster */
@@ -552,9 +730,15 @@ const STYLES = `
 .sb-agent.sb-selected { border-color: #10b981; box-shadow: inset 0 0 0 1px #10b981; }
 .sb-agent-top { display: flex; align-items: center; gap: 6px; }
 .sb-agent-name { font-weight: 700; font-size: 12px; flex: 1; }
-.sb-role { font-size: 9px; font-weight: 800; letter-spacing: 0.06em; padding: 1px 5px; border-radius: 3px; color: #fff; }
-.sb-role.guard { background: #2563eb; }
-.sb-role.strike { background: #b45309; }
+.sb-mode { font-size: 9px; font-weight: 800; letter-spacing: 0.06em; padding: 1px 5px; border-radius: 3px; color: #fff; }
+.sb-mode.sim { background: #2563eb; }
+.sb-mode.real { background: #b45309; }
+
+/* wiring */
+.sb-wire { font-family: ui-monospace, monospace; font-size: 10.5px; line-height: 1.6; }
+.sb-wire-row { display: flex; gap: 6px; }
+.sb-wire-key { opacity: 0.55; min-width: 52px; flex-shrink: 0; }
+.sb-wire-val { word-break: break-all; }
 
 /* bars */
 .sb-bar { position: relative; height: 8px; border-radius: 4px; background: rgba(127,127,127,0.25); overflow: hidden; }
@@ -563,6 +747,7 @@ const STYLES = `
 .sb-bar-lg { height: 14px; border-radius: 4px; }
 
 /* metrics table */
+.sb-scroll { overflow-x: auto; }
 .sb-table { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
 .sb-table th {
   text-align: right; font-weight: 600; opacity: 0.6; padding: 3px 6px; white-space: nowrap;
@@ -575,6 +760,7 @@ const STYLES = `
 .sb-warn { color: #f59e0b; font-weight: 700; }
 .sb-bad { color: #dc2626; font-weight: 700; }
 .sb-muted { opacity: 0.45; }
+.sb-src { font-size: 9px; opacity: 0.5; margin-left: 3px; }
 
 /* transitions log */
 .sb-log {
@@ -607,18 +793,20 @@ const STYLES = `
 
 // ─────────────────────────── topology drawing ─────────────────────────────────
 //
-// Multi-tiered network topology: GCS/DDS domain → {Wi-Fi mesh | 5G/4G cellular}
-// → agents. The path actually carrying each agent's telemetry is drawn solid
-// and coloured by link health; the standby path is dashed and dimmed, so a
-// failover is legible at a glance.
+// GCS/DDS domain → {local Wi-Fi/LAN | 4G/5G Tailscale VPN} → agents. The path
+// actually carrying each agent's telemetry is drawn solid and coloured by link
+// health; a provisioned-but-standby path is dashed, and a path nothing has ever
+// used is not drawn at all.
 
-function topologySvg(agents) {
+function topologySvg(agents, lanes) {
   const n = Math.max(1, agents.length);
   const colW = 118;
   const w = Math.max(430, n * colW + 40);
   const h = 208;
   const gcsY = 24, laneY = 92, agentY = 176;
-  const laneCx = [w / 2 - 118, w / 2 + 118];
+  const spread = lanes.length > 1 ? 118 : 0;
+  const laneCx = lanes.map((_, i) =>
+    lanes.length > 1 ? w / 2 + (i === 0 ? -spread : spread) : w / 2);
   const ax = (i) => (w - (n - 1) * colW) / 2 + i * colW;
 
   const parts = [];
@@ -632,10 +820,10 @@ function topologySvg(agents) {
   // GCS / DDS domain
   parts.push(`<rect x="${w / 2 - 92}" y="${gcsY - 15}" width="184" height="30" rx="6" class="tp-box"/>`);
   parts.push(`<text class="tp-lbl" x="${w / 2}" y="${gcsY - 1}">GCS · ROS 2 / DDS domain</text>`);
-  parts.push(`<text class="tp-sub" x="${w / 2}" y="${gcsY + 10}">PTP time sync · QoS · dynamic routing</text>`);
+  parts.push(`<text class="tp-sub" x="${w / 2}" y="${gcsY + 10}">time sync · QoS · dynamic routing</text>`);
 
   // Transport lanes
-  TIERS.forEach((tier, ti) => {
+  lanes.forEach((tier, ti) => {
     const anyActive = agents.some((a) => a.activeTier === tier.id);
     const cx = laneCx[ti];
     const stroke = anyActive ? "#10b981" : "rgba(127,127,127,.55)";
@@ -643,19 +831,18 @@ function topologySvg(agents) {
       fill="${anyActive ? "rgba(16,185,129,.14)" : "rgba(127,127,127,.08)"}" stroke="${stroke}" stroke-width="${anyActive ? 1.6 : 1}"/>`);
     parts.push(`<text class="tp-lbl" x="${cx}" y="${laneY - 1}">${tier.label}</text>`);
     parts.push(`<text class="tp-sub" x="${cx}" y="${laneY + 10}">${tier.sub}</text>`);
-    // GCS → lane
     parts.push(`<path d="M ${w / 2} ${gcsY + 15} C ${w / 2} ${laneY - 40}, ${cx} ${laneY - 45}, ${cx} ${laneY - 15}"
       fill="none" stroke="${stroke}" stroke-width="${anyActive ? 2 : 1}" ${anyActive ? "" : 'stroke-dasharray="4 3" opacity="0.5"'}/>`);
   });
 
-  // Agents + their two links
+  // Agents + their links
   agents.forEach((a, i) => {
     const x = ax(i);
     const color = a.linkState.color;
-    TIERS.forEach((tier, ti) => {
+    lanes.forEach((tier, ti) => {
       const active = a.activeTier === tier.id;
-      const fresh = tier.id === "primary" ? a.metrics?.primaryFresh : a.metrics?.backupFresh;
-      const provisioned = tier.id === "primary" ? a.tiers.primary.everSeen : a.tiers.backup.everSeen;
+      const fresh = tier.id === "lan" ? a.metrics?.lanFresh : a.metrics?.vpnFresh;
+      const provisioned = a.tiers[tier.id].everSeen;
       const cx = laneCx[ti];
       let stroke, width, dash, opacity;
       if (active) { stroke = color; width = 2.4; dash = ""; opacity = 1; }
@@ -664,12 +851,12 @@ function topologySvg(agents) {
       parts.push(`<path d="M ${cx} ${laneY + 15} C ${cx} ${agentY - 42}, ${x} ${agentY - 46}, ${x} ${agentY - 16}"
         fill="none" stroke="${stroke}" stroke-width="${width}" ${dash} opacity="${opacity}"/>`);
     });
-    const roleColor = a.role === "strike" ? "#b45309" : "#2563eb";
+    const modeColor = MODES[a.mode].color;
     parts.push(`<rect x="${x - 46}" y="${agentY - 16}" width="92" height="32" rx="5"
       fill="rgba(127,127,127,.12)" stroke="${color}" stroke-width="1.6"/>`);
-    parts.push(`<circle cx="${x - 34}" cy="${agentY - 4}" r="4" fill="${roleColor}"/>`);
+    parts.push(`<circle cx="${x - 34}" cy="${agentY - 4}" r="4" fill="${modeColor}"/>`);
     parts.push(`<text class="tp-lbl" x="${x + 5}" y="${agentY - 1}">${a.name}</text>`);
-    parts.push(`<text class="tp-sub" x="${x}" y="${agentY + 11}">${a.linkState.label}</text>`);
+    parts.push(`<text class="tp-sub" x="${x}" y="${agentY + 11}">${MODES[a.mode].label} · ${a.linkState.label}</text>`);
   });
 
   parts.push(`</svg>`);
@@ -694,8 +881,12 @@ function activate(extensionContext) {
 
       let agents = [];                 // rebuilt whenever the roster config changes
       const byTopic = new Map();       // topic → [{agent, kind}]
+      let available = new Set();       // topic names seen on the data source
+      let topicsKey = "";              // change detector for the topic list
+      let caps = {};                   // which sections have a source
       let statusText = "";
       let lastTopoKey = null;
+      let safetyArmedUntil = 0;
       // "Now" is anchored on the newest receive time and advanced by real
       // elapsed time. Live, that is just the wall clock; during playback it
       // tracks bag time, and it keeps advancing when the data stops so link
@@ -710,24 +901,79 @@ function activate(extensionContext) {
         panelContext.saveState({ ...cfg, selected, formation });
       }
 
+      // ── wiring: mode → topics ────────────────────────────────────────────
+      //
+      // An agent's mode IS its wiring. "sim" talks to the MAVROS interface,
+      // "real" talks to px4_interface over uXRCE-DDS and additionally carries
+      // the mocap + EKF + timesync streams that only exist on hardware.
+
+      function wiringFor(agent) {
+        const n = agent.name;
+        const real = agent.mode === "real";
+        return {
+          state: tpl(cfg.stateTopicTemplate, n),
+          battery: tpl(real ? cfg.realBatteryTopicTemplate : cfg.simBatteryTopicTemplate, n),
+          command: tpl(real ? cfg.realCommandTopicTemplate : cfg.simCommandTopicTemplate, n),
+          robotCommand: tpl(real ? cfg.realRobotCommandTemplate : cfg.simRobotCommandTemplate, n),
+          mocap: real ? tpl(cfg.mocapTopicTemplate, n) : null,
+          ekfFlags: real ? tpl(cfg.ekfFlagsTopicTemplate, n) : null,
+          localPosition: real ? tpl(cfg.localPositionTopicTemplate, n) : null,
+          timesync: real ? tpl(cfg.timesyncTopicTemplate, n) : null,
+          lan: tpl(cfg.lanTopicTemplate, n),
+          vpn: tpl(cfg.vpnTopicTemplate, n),
+          cellular: tpl(cfg.cellularTopicTemplate, n),
+        };
+      }
+
+      // px4_interface publishes under /{name}/fmu/..., the MAVROS interface
+      // under /{name}/interface/... — so the topics on the wire tell us how
+      // this agent is actually wired, with no extra configuration.
+      function detectMode(name) {
+        let real = false, sim = false;
+        for (const t of available) {
+          if (t.startsWith(`/${name}/fmu/`)) real = true;
+          else if (t.startsWith(`/${name}/interface/`)) sim = true;
+        }
+        return real ? "real" : sim ? "sim" : null;
+      }
+
+      function resolveModes() {
+        const configured = splitList(cfg.modes).map((m) => m.toLowerCase());
+        agents.forEach((a, i) => {
+          const want = configured[i];
+          if (want === "sim" || want === "real") {
+            a.mode = want;
+            a.modeSource = "config";
+            return;
+          }
+          const detected = detectMode(a.name);
+          if (detected) {
+            a.mode = detected;
+            a.modeSource = "detected";
+          } else {
+            a.mode = "sim";
+            a.modeSource = "default";
+          }
+        });
+      }
+
       // ── roster / subscriptions ───────────────────────────────────────────
       function rebuildAgents() {
         const names = splitList(cfg.drones);
-        const roles = splitList(cfg.roles);
         const prev = new Map(agents.map((a) => [a.name, a]));
         // drone_position_offsets, flat x,y,z per agent (see swarm_sim.yaml).
         const offsets = splitList(cfg.positionOffsets).map(Number);
         agents = names.map((name, i) => {
-          const role = (roles[i] ?? "guard").toLowerCase() === "strike" ? "strike" : "guard";
           const at = (k) => (Number.isFinite(offsets[i * 3 + k]) ? offsets[i * 3 + k] : 0);
-          const agent = prev.get(name) ?? newAgent(name, role, cfg);
-          agent.role = role;
+          const agent = prev.get(name) ?? newAgent(name);
           agent.offset = [at(0), at(1), at(2)];
           return agent;
         });
         if (!agents.some((a) => a.name === selected)) selected = agents[0]?.name ?? null;
+        resolveModes();
         rebuildSubscriptions();
         buildRoster();
+        recomputeCaps();
       }
 
       function rebuildSubscriptions() {
@@ -738,17 +984,67 @@ function activate(extensionContext) {
           byTopic.get(topic).push({ agent, kind });
         };
         for (const a of agents) {
-          const t = (tmpl) => (tmpl ? String(tmpl).replace("{name}", a.name) : null);
-          a.tiers.primary.topic = t(cfg.primaryTopicTemplate);
-          a.tiers.backup.topic = t(cfg.backupTopicTemplate);
-          add(t(cfg.stateTopicTemplate), a, "state");
-          add(a.tiers.primary.topic, a, "primary");
-          add(a.tiers.backup.topic, a, "backup");
-          add(t(cfg.batteryTopicTemplate), a, "battery");
-          add(t(cfg.batteryAltTopicTemplate), a, "battery");
-          add(t(cfg.linkStatusTopicTemplate), a, "linkstatus");
+          const n = a.name;
+          a.tiers.lan.topic = tpl(cfg.lanTopicTemplate, n);
+          a.tiers.vpn.topic = tpl(cfg.vpnTopicTemplate, n);
+          a.mocap.topic = tpl(cfg.mocapTopicTemplate, n);
+          add(tpl(cfg.stateTopicTemplate, n), a, "state");
+          add(a.tiers.lan.topic, a, "lan");
+          add(a.tiers.vpn.topic, a, "vpn");
+          add(a.mocap.topic, a, "mocap");
+          // Both battery shapes are subscribed regardless of mode: a wrong
+          // mode guess must not blank the power picture. normaliseBattery
+          // accepts either message.
+          add(tpl(cfg.simBatteryTopicTemplate, n), a, "battery");
+          add(tpl(cfg.realBatteryTopicTemplate, n), a, "battery");
+          add(tpl(cfg.ekfFlagsTopicTemplate, n), a, "ekfflags");
+          add(tpl(cfg.localPositionTopicTemplate, n), a, "localpos");
+          add(tpl(cfg.timesyncTopicTemplate, n), a, "timesync");
+          add(tpl(cfg.cellularTopicTemplate, n), a, "cellular");
+          add(tpl(cfg.linkStatusTopicTemplate, n), a, "linkstatus");
         }
         panelContext.subscribe([...byTopic.keys()].map((topic) => ({ topic })));
+      }
+
+      // ── section visibility ───────────────────────────────────────────────
+      //
+      // A section is rendered only when something is actually publishing what
+      // it needs. Before any topic list has arrived (a fresh connection, or a
+      // data source that does not advertise topics) everything is shown —
+      // an empty panel would be a worse failure than an over-full one.
+
+      function recomputeCaps() {
+        const showAll = cfg.sections === "all" || available.size === 0;
+        const has = (t) => Boolean(t) && available.has(t);
+        const any = (fn) => agents.some(fn);
+        caps = {
+          discovered: available.size > 0,
+          forced: showAll,
+          mocap: showAll || any((a) => has(tpl(cfg.mocapTopicTemplate, a.name))),
+          ekf: showAll || any((a) => has(tpl(cfg.ekfFlagsTopicTemplate, a.name))
+            || has(tpl(cfg.localPositionTopicTemplate, a.name))),
+          timesync: showAll || any((a) => has(tpl(cfg.timesyncTopicTemplate, a.name))),
+          cellular: showAll || any((a) => has(tpl(cfg.cellularTopicTemplate, a.name))
+            || has(tpl(cfg.vpnTopicTemplate, a.name))),
+          vpnLane: showAll || any((a) => has(tpl(cfg.vpnTopicTemplate, a.name))),
+          battery: showAll || any((a) => has(tpl(cfg.simBatteryTopicTemplate, a.name))
+            || has(tpl(cfg.realBatteryTopicTemplate, a.name))),
+          formation: showAll || has(cfg.formationTopic),
+          teleop: any((a) => has(tpl(cfg.teleopTopicTemplate, a.name))),
+          goal: any((a) => has(tpl(cfg.goalTopicTemplate, a.name))),
+        };
+      }
+
+      // The task set the panel inferred, shown in the banner so the operator
+      // can see why a section is or is not there.
+      function detectedTasks() {
+        const tasks = [];
+        if (caps.goal) tasks.push("goal-tracking");
+        if (caps.formation) tasks.push("formation");
+        if (caps.teleop) tasks.push("teleop");
+        if (caps.mocap || caps.ekf) tasks.push("mocap/hardware");
+        if (caps.cellular) tasks.push("cellular");
+        return tasks;
       }
 
       // ── message handling ─────────────────────────────────────────────────
@@ -781,15 +1077,23 @@ function activate(extensionContext) {
         }
       }
 
-      function handleLinkStatus(a, msg, rx) {
-        try {
-          const raw = msg?.data;
-          a.reported = typeof raw === "string" ? JSON.parse(raw) : (raw ?? msg);
-          a.reportedAt = rx;
-        } catch { /* a malformed report just leaves the derived metrics in place */ }
+      function handleJson(msg) {
+        const raw = msg?.data;
+        if (typeof raw === "string") return JSON.parse(raw);
+        return raw ?? msg;
       }
 
       panelContext.onRender = (renderState, done) => {
+        if (renderState.topics) {
+          const key = renderState.topics.map((t) => t.name).join(" ");
+          if (key !== topicsKey) {
+            topicsKey = key;
+            available = new Set(renderState.topics.map((t) => t.name));
+            resolveModes();
+            recomputeCaps();
+            buildRoster();
+          }
+        }
         const frame = renderState.currentFrame;
         if (frame) {
           for (const evt of frame) {
@@ -799,10 +1103,22 @@ function activate(extensionContext) {
             if (clockRx == null || rx > clockRx) { clockRx = rx; clockWall = Date.now() / 1000; }
             const stamp = toSec(evt.message?.header?.stamp);
             for (const { agent, kind } of entries) {
-              if (kind === "state") handleState(agent, evt.message, rx);
-              else if (kind === "battery") handleBattery(agent, evt.message, rx);
-              else if (kind === "linkstatus") handleLinkStatus(agent, evt.message, rx);
-              else tierOnMessage(agent.tiers[kind], rx, stamp);
+              switch (kind) {
+                case "state": handleState(agent, evt.message, rx); break;
+                case "battery": handleBattery(agent, evt.message, rx); break;
+                case "ekfflags": agent.ekfFlags = evt.message; agent.ekfAt = rx; break;
+                case "localpos": agent.localPos = evt.message; agent.localPosAt = rx; break;
+                case "timesync": agent.timesync = evt.message; agent.timesyncAt = rx; break;
+                case "linkstatus":
+                  // A malformed report leaves the derived metrics in place.
+                  try { agent.reported = handleJson(evt.message); agent.reportedAt = rx; } catch { /* ignore */ }
+                  break;
+                case "cellular":
+                  try { agent.cellular = handleJson(evt.message); agent.cellularAt = rx; } catch { /* ignore */ }
+                  break;
+                case "mocap": streamOnMessage(agent.mocap, rx, stamp); break;
+                default: streamOnMessage(agent.tiers[kind], rx, stamp); break;
+              }
             }
           }
         }
@@ -824,16 +1140,31 @@ function activate(extensionContext) {
         if (text != null) n.textContent = text;
         return n;
       };
+      const show = (node, visible) => { node.hidden = !visible; };
 
       // Banner
       const banner = el("div", "sb-card sb-banner");
       const linkChip = el("span", "sb-chip");
+      const estChip = el("span", "sb-chip");
       const powerChip = el("span", "sb-chip");
-      const guardChip = el("span", "sb-chip sb-quiet");
-      const strikeChip = el("span", "sb-chip sb-quiet");
+      const modeChip = el("span", "sb-chip sb-quiet");
+      const taskChip = el("span", "sb-chip sb-quiet");
       const clockEl = el("span", "sb-status");
-      banner.append(linkChip, powerChip, guardChip, strikeChip, el("div", "sb-spacer"), clockEl);
+      banner.append(linkChip, estChip, powerChip, modeChip, taskChip,
+        el("div", "sb-spacer"), clockEl);
       root.appendChild(banner);
+
+      // Safety bar — the one control an operator must be able to hit without
+      // reading anything. Two clicks (arm, then fire) rather than a modal:
+      // fast under stress, but an accidental brush cannot land the swarm.
+      const safetyBar = el("div", "sb-safety");
+      const holdBtn = el("button", "sb-safety-hold", "Hold All");
+      holdBtn.title = "Freeze every commanded drone at its current position (scenario stops)";
+      holdBtn.addEventListener("click", () => callLifecycle("hold"));
+      const stopBtn = el("button", "sb-safety-stop");
+      stopBtn.addEventListener("click", onSafetyClick);
+      safetyBar.append(holdBtn, stopBtn);
+      root.appendChild(safetyBar);
 
       // Command strip
       const cmdCard = el("div", "sb-card");
@@ -896,7 +1227,7 @@ function activate(extensionContext) {
         rosterBody.textContent = "";
         rosterRows.clear();
         if (!agents.length) {
-          rosterBody.appendChild(el("div", "sb-note", "No agents configured — set the drone list in the panel settings."));
+          rosterBody.appendChild(el("div", "sb-note", "No agents configured — set the agent list in the panel settings."));
           return;
         }
         for (const a of agents) {
@@ -904,8 +1235,8 @@ function activate(extensionContext) {
           const top = el("div", "sb-agent-top");
           const dot = el("span", "sb-dot");
           const name = el("span", "sb-agent-name", a.name);
-          const role = el("span", `sb-role ${a.role}`, a.role === "strike" ? "STRIKE" : "GUARD");
-          top.append(dot, name, role);
+          const mode = el("span", `sb-mode ${a.mode}`, MODES[a.mode].label);
+          top.append(dot, name, mode);
           const bar = el("div", "sb-bar");
           const fill = el("div", "sb-bar-fill");
           bar.appendChild(fill);
@@ -913,27 +1244,42 @@ function activate(extensionContext) {
           row.append(top, bar, meta);
           row.addEventListener("click", () => { selected = a.name; persist(); render(); });
           rosterBody.appendChild(row);
-          rosterRows.set(a.name, { row, dot, fill, meta });
+          rosterRows.set(a.name, { row, dot, fill, meta, mode });
         }
       }
 
-      // CommLink section
+      // Wiring card — makes "mode = wiring" concrete for the selected agent.
+      const wireCard = el("div", "sb-card");
+      const wireTitle = el("div", "sb-title");
+      wireTitle.append(document.createTextNode("Wiring "));
+      wireTitle.appendChild(el("span", "sb-sub", "— topics this mode uses"));
+      wireCard.appendChild(wireTitle);
+      const wireBody = el("div", "sb-wire");
+      wireCard.appendChild(wireBody);
+      const wireNote = el("div", "sb-note");
+      wireNote.style.marginTop = "6px";
+      wireCard.appendChild(wireNote);
+      leftCol.appendChild(wireCard);
+
+      // Link safety section
       const commCard = el("div", "sb-card");
       const commTitle = el("div", "sb-title");
-      commTitle.append(document.createTextNode("CommLink Robustness "));
-      commTitle.appendChild(el("span", "sb-sub", "— dual-link redundancy · drop rate · RTT · PTP drift"));
+      commTitle.append(document.createTextNode("Link Safety "));
+      const commSub = el("span", "sb-sub");
+      commTitle.appendChild(commSub);
       commCard.appendChild(commTitle);
       const topoBox = el("div");
       topoBox.style.cssText = "margin-bottom:8px;overflow-x:auto;";
       commCard.appendChild(topoBox);
+      const metricsScroll = el("div", "sb-scroll");
       const metricsTable = el("table", "sb-table");
       const metricsHead = el("thead");
-      metricsHead.innerHTML =
-        "<tr><th>Agent</th><th>Active tier</th><th>Rate</th><th>Drop</th><th>RTT</th>" +
-        "<th>PTP sync floor</th><th>PTP drift</th><th>State</th></tr>";
+      const metricsHeadRow = el("tr");
+      metricsHead.appendChild(metricsHeadRow);
       const metricsBody = el("tbody");
       metricsTable.append(metricsHead, metricsBody);
-      commCard.appendChild(metricsTable);
+      metricsScroll.appendChild(metricsTable);
+      commCard.appendChild(metricsScroll);
       const targetsNote = el("div", "sb-note");
       targetsNote.style.marginTop = "5px";
       commCard.appendChild(targetsNote);
@@ -941,6 +1287,28 @@ function activate(extensionContext) {
       const logBox = el("div", "sb-log");
       commCard.appendChild(logBox);
       rightCol.appendChild(commCard);
+
+      // Cellular / Tailscale section
+      const cellCard = el("div", "sb-card");
+      const cellTitle = el("div", "sb-title");
+      cellTitle.append(document.createTextNode("Cellular · Tailscale VPN "));
+      cellTitle.appendChild(el("span", "sb-sub", "— 4G/5G transport delay"));
+      cellCard.appendChild(cellTitle);
+      const cellScroll = el("div", "sb-scroll");
+      const cellTable = el("table", "sb-table");
+      const cellHead = el("thead");
+      const cellCols = ["Agent", "Network", "VPN ping", "Path", "Signal", "Interface", "Report age"];
+      const cellHeadRow = el("tr");
+      for (const c of cellCols) cellHeadRow.appendChild(el("th", null, c));
+      cellHead.appendChild(cellHeadRow);
+      const cellBody = el("tbody");
+      cellTable.append(cellHead, cellBody);
+      cellScroll.appendChild(cellTable);
+      cellCard.appendChild(cellScroll);
+      const cellNote = el("div", "sb-note");
+      cellNote.style.marginTop = "5px";
+      cellCard.appendChild(cellNote);
+      rightCol.appendChild(cellCard);
 
       // Power section
       const powerCard = el("div", "sb-card");
@@ -988,9 +1356,13 @@ function activate(extensionContext) {
         statusEl.textContent = statusText;
       }
 
+      function servicesAvailable() {
+        return typeof panelContext.callService === "function";
+      }
+
       function callLifecycle(id) {
         const service = `${String(cfg.commanderNs).replace(/\/$/, "")}/${id}`;
-        if (typeof panelContext.callService !== "function") {
+        if (!servicesAvailable()) {
           setStatus(`Service calls unavailable in this data source (wanted ${service})`);
           return;
         }
@@ -1003,6 +1375,34 @@ function activate(extensionContext) {
             setStatus(`${service}: ${okFlag === false ? "REJECTED" : "ok"}${msg}`);
           })
           .catch((err) => setStatus(`${service} failed: ${err?.message ?? err}`));
+      }
+
+      function onSafetyClick() {
+        const t = Date.now() / 1000;
+        if (t < safetyArmedUntil) {
+          safetyArmedUntil = 0;
+          callLifecycle("land");
+          setStatus("SAFETY STOP — landing all commanded drones");
+        } else {
+          safetyArmedUntil = t + SAFETY_ARM_S;
+        }
+        renderSafety();
+      }
+
+      function renderSafety() {
+        const remaining = safetyArmedUntil - Date.now() / 1000;
+        const armed = remaining > 0;
+        stopBtn.classList.toggle("sb-armed", armed);
+        stopBtn.textContent = armed
+          ? `Confirm — Land All (${Math.ceil(remaining)})`
+          : "Safety Stop · Land All";
+        stopBtn.title = armed
+          ? "Click again to land every commanded drone now"
+          : "Two clicks: arm, then confirm. Lands every commanded drone and disarms on touchdown.";
+        const ok = servicesAvailable();
+        stopBtn.disabled = !ok;
+        holdBtn.disabled = !ok;
+        if (!armed && safetyArmedUntil !== 0 && remaining <= 0) safetyArmedUntil = 0;
       }
 
       function sendFormation(nameArg) {
@@ -1036,125 +1436,235 @@ function activate(extensionContext) {
         else td.classList.add("sb-bad");
       }
 
-      function render() {
-        const now = nowSec();
-        for (const a of agents) {
-          evaluateLink(a, cfg, now);
-          evaluatePower(a, cfg, now);
+      function chipCell(state) {
+        const td = el("td");
+        const chip = el("span", "sb-chip", state.label);
+        chip.style.background = state.color;
+        chip.style.fontSize = "10px";
+        td.appendChild(chip);
+        return td;
+      }
+
+      function renderWiring() {
+        const a = agents.find((x) => x.name === selected);
+        wireBody.textContent = "";
+        if (!a) {
+          wireNote.textContent = "";
+          wireBody.appendChild(el("div", "sb-note", "No agent selected."));
+          return;
         }
-
-        // Banner
-        const worstLink = worst(agents.map((a) => a.linkState), LINK_STATE);
-        linkChip.textContent = `COMMLINK ${worstLink.label}`;
-        linkChip.style.background = worstLink.color;
-        const worstPower = worst(agents.map((a) => a.power?.state), RTB_STATE);
-        powerChip.textContent = `POWER ${worstPower.label}`;
-        powerChip.style.background = worstPower.color;
-        const guards = agents.filter((a) => a.role === "guard").length;
-        const strikes = agents.length - guards;
-        guardChip.textContent = `Guard ${guards}`;
-        strikeChip.textContent = `Strike ${strikes}`;
-        const airborne = agents.filter((a) => a.pos && a.pos[2] > 0.3).length;
-        clockEl.textContent = `${airborne}/${agents.length} airborne · ${clockStamp(now)}`;
-
-        // Roster
-        for (const a of agents) {
-          const r = rosterRows.get(a.name);
-          if (!r) continue;
-          r.row.classList.toggle("sb-selected", a.name === selected);
-          r.dot.style.background = a.linkState.color;
-          const soc = a.power?.soc;
-          r.fill.style.width = `${clamp(soc ?? 0, 0, 100)}%`;
-          r.fill.style.background = socColor(soc);
-          const rtt = a.metrics?.rttMs;
-          r.meta.textContent =
-            `${soc == null ? "-- %" : soc.toFixed(0) + "%"} · ` +
-            `${a.linkState.label}${a.activeTier ? " (" + a.activeTier + ")" : ""} · ` +
-            `${rtt == null ? "-- ms" : rtt.toFixed(0) + " ms"}`;
+        const w = wiringFor(a);
+        const rows = [
+          ["mode", `${MODES[a.mode].label}  (${a.modeSource})`],
+          ["state", w.state],
+          ["cmd", w.command],
+          ["service", w.robotCommand],
+          ["battery", w.battery],
+        ];
+        if (a.mode === "real") {
+          rows.push(["mocap", w.mocap], ["ekf", w.ekfFlags], ["ping", w.timesync]);
         }
-
-        // Topology — reparsing SVG markup 5x/s is wasteful, so only redraw when
-        // the picture would actually change.
-        const topoKey = agents.map((a) =>
-          `${a.name}:${a.role}:${a.linkState.label}:${a.activeTier}:` +
-          `${a.tiers.primary.everSeen}${a.tiers.backup.everSeen}`).join("|");
-        if (topoKey !== lastTopoKey) {
-          lastTopoKey = topoKey;
-          topoBox.innerHTML = agents.length
-            ? topologySvg(agents)
-            : '<div class="sb-note">No agents configured.</div>';
+        if (caps.cellular) rows.push(["cellular", w.cellular]);
+        for (const [k, v] of rows) {
+          if (!v) continue;
+          const row = el("div", "sb-wire-row");
+          row.append(el("span", "sb-wire-key", k));
+          const val = el("span", "sb-wire-val", v);
+          if (caps.discovered && k !== "mode" && !available.has(v)) {
+            val.classList.add("sb-muted");
+            val.title = "not present on this data source";
+          }
+          row.appendChild(val);
+          wireBody.appendChild(row);
         }
+        wireNote.textContent = a.modeSource === "detected"
+          ? "Mode detected from the topics on the wire. Pin it per agent with the Modes setting."
+          : a.modeSource === "config"
+            ? "Mode pinned in the panel settings (mirrors swarm_commander's drone_modes)."
+            : "No agent topics discovered yet — assuming sim wiring.";
+      }
 
-        // Metrics table
+      function renderLinkTable(now, lanes) {
+        const cols = ["Agent", "Mode", "Path", "Rate", "Ping", "Drop"];
+        if (caps.mocap) cols.push("Mocap age");
+        if (caps.ekf) cols.push("EKF");
+        cols.push("Clock drift", "State");
+        metricsHeadRow.textContent = "";
+        for (const c of cols) metricsHeadRow.appendChild(el("th", null, c));
+
         metricsBody.textContent = "";
+        if (!agents.length) {
+          const tr = el("tr");
+          const td = el("td", "sb-note", "No agents configured.");
+          td.colSpan = cols.length;
+          tr.appendChild(td);
+          metricsBody.appendChild(tr);
+          return;
+        }
+
         for (const a of agents) {
           const tr = el("tr");
           if (a.name === selected) tr.className = "sb-selected";
           const m = a.metrics ?? {};
 
           const tdName = el("td", null, a.name);
+
+          const tdMode = el("td");
+          const modeSpan = el("span", `sb-mode ${a.mode}`, MODES[a.mode].label);
+          tdMode.appendChild(modeSpan);
+
           const tdTier = el("td");
-          if (a.activeTier === "backup") {
-            tdTier.textContent = "5G / 4G";
+          if (a.activeTier === "vpn") {
+            tdTier.textContent = "4G/5G VPN";
             tdTier.className = "sb-warn";
-          } else if (a.activeTier === "primary") {
-            tdTier.textContent = "Wi-Fi mesh";
+          } else if (a.activeTier === "lan") {
+            tdTier.textContent = "Wi-Fi / LAN";
             tdTier.className = "sb-ok";
           } else {
             tdTier.textContent = "--";
             tdTier.className = "sb-muted";
           }
+
           const tdRate = el("td", m.rateHz == null ? "sb-muted" : null, fmt(m.rateHz, 1, " Hz"));
+
+          const tdPing = el("td");
+          const pingTarget = a.activeTier === "vpn"
+            ? Number(cfg.vpnPingTargetMs) : Number(cfg.pingTargetMs);
+          gradeCell(tdPing, m.pingMs, pingTarget, 1, " ms");
+          if (m.pingSource) tdPing.appendChild(el("span", "sb-src", m.pingSource));
+
           const tdDrop = el("td");
           gradeCell(tdDrop, m.dropPct, Number(cfg.dropTargetPct), 2, " %");
-          const tdRtt = el("td");
-          gradeCell(tdRtt, m.rttMs, Number(cfg.rttTargetMs), 1, " ms");
-          const tdOff = el("td", m.ptpOffsetMs == null ? "sb-muted" : null, fmt(m.ptpOffsetMs, 2, " ms"));
+
+          tr.append(tdName, tdMode, tdTier, tdRate, tdPing, tdDrop);
+
+          if (caps.mocap) {
+            const td = el("td");
+            const est = a.estimate;
+            if (a.mode !== "real" || !est?.mocapSeen) {
+              td.textContent = "--";
+              td.className = "sb-muted";
+              td.title = a.mode !== "real" ? "sim agent: PX4 SITL estimates its own state"
+                : "no mocap samples received";
+            } else if (!est.mocapFresh) {
+              td.textContent = `LOST ${fmt(est.mocapSilentS, 1, " s")}`;
+              td.className = "sb-bad";
+              td.title = "no mocap sample inside the timeout — PX4 has no external position source";
+            } else {
+              gradeCell(td, est.mocapAgeMs, Number(cfg.mocapAgeTargetMs), 1, " ms");
+              td.appendChild(el("span", "sb-src", fmt(est.mocapRateHz, 0, " Hz")));
+              td.title = "rx time minus mocap header stamp — the delay of the state estimate PX4 fuses";
+            }
+            tr.appendChild(td);
+          }
+
+          if (caps.ekf) {
+            const est = a.estimate;
+            const td = chipCell(est?.state ?? EKF_STATE.NO_DATA);
+            if (est?.detail?.length) td.title = est.detail.join(" · ");
+            tr.appendChild(td);
+          }
+
           const tdDrift = el("td");
-          const drift = m.ptpDriftMsPerMin;
+          const drift = m.clockDriftMsPerMin;
           tdDrift.textContent = drift == null ? "--" : `${drift >= 0 ? "+" : ""}${drift.toFixed(2)} ms/min`;
           tdDrift.className = drift == null ? "sb-muted"
             : Math.abs(drift) <= 1 ? "sb-ok" : Math.abs(drift) <= 5 ? "sb-warn" : "sb-bad";
-          const tdState = el("td");
-          const chip = el("span", "sb-chip", a.linkState.label);
-          chip.style.background = a.linkState.color;
-          chip.style.fontSize = "10px";
-          tdState.appendChild(chip);
+          if (m.clockOffsetMs != null) tdDrift.title = `offset ${m.clockOffsetMs.toFixed(2)} ms`;
+          tr.appendChild(tdDrift);
 
-          tr.append(tdName, tdTier, tdRate, tdDrop, tdRtt, tdOff, tdDrift, tdState);
+          tr.appendChild(chipCell(a.linkState));
+
           tr.addEventListener("click", () => { selected = a.name; persist(); render(); });
           tr.style.cursor = "pointer";
           metricsBody.appendChild(tr);
         }
+
+        const lanesLabel = lanes.map((l) => l.label).join(" + ");
+        const vpnCount = agents.filter((a) => a.tiers.vpn.everSeen).length;
+        targetsNote.textContent =
+          `Targets: ping < ${cfg.pingTargetMs} ms on Wi-Fi/LAN, < ${cfg.vpnPingTargetMs} ms on the ` +
+          `4G/5G VPN, packet drop < ${cfg.dropTargetPct}%` +
+          (caps.mocap ? `, mocap age < ${cfg.mocapAgeTargetMs} ms` : "") + ". " +
+          "Ping prefers a measured round-trip — PX4's uXRCE-DDS timesync on real agents, the " +
+          "Tailscale reporter on the VPN path — and falls back to twice the mean arrival delay, " +
+          "which is only valid while the clocks agree (read it against the drift column). " +
+          `Drop is over a ${METRIC_WINDOW_S}s window; outages are reported as state transitions ` +
+          `instead. Transports in use: ${lanesLabel || "none"}` +
+          (caps.vpnLane ? ` · VPN provisioned on ${vpnCount}/${agents.length} agents.` : ".");
+      }
+
+      function renderCellular(now) {
+        cellBody.textContent = "";
+        let anyReport = false;
+        for (const a of agents) {
+          const c = freshReport(a.cellular, a.cellularAt, now);
+          if (c) anyReport = true;
+          const tr = el("tr");
+          if (a.name === selected) tr.className = "sb-selected";
+
+          const tdName = el("td", null, a.name);
+
+          const tier = c?.tier ?? c?.network ?? null;
+          const tdTier = el("td", tier ? null : "sb-muted", tier ?? "--");
+
+          // Prefer the reporter's own measurement; fall back to the arrival
+          // statistics of whatever DDS traffic is riding the VPN topic.
+          const tdPing = el("td");
+          const reported = num(c?.rtt_ms);
+          const derived = streamDerivedRttMs(a.tiers.vpn, now);
+          const value = reported != null ? reported : derived;
+          gradeCell(tdPing, value, Number(cfg.vpnPingTargetMs), 1, " ms");
+          if (value != null) {
+            tdPing.appendChild(el("span", "sb-src", reported != null ? "tailscale" : "derived"));
+          }
+
+          const path = c?.state ?? c?.path ?? null;
+          const tdPath = el("td", null, path ?? "--");
+          if (path == null) tdPath.className = "sb-muted";
+          else if (String(path).toLowerCase() === "direct") tdPath.className = "sb-ok";
+          else if (String(path).toLowerCase() === "relay") {
+            tdPath.className = "sb-warn";
+            tdPath.title = "Tailscale is relaying via DERP — expect the higher latency";
+          } else tdPath.className = "sb-bad";
+
+          const signal = num(c?.rsrp_dbm) ?? num(c?.rssi_dbm);
+          const tdSignal = el("td", signal == null ? "sb-muted" : null,
+            signal == null ? "--" : `${signal.toFixed(0)} dBm`);
+
+          const iface = c?.interface ?? c?.iface ?? null;
+          const tdIface = el("td", iface ? null : "sb-muted", iface ?? "--");
+
+          const age = a.cellularAt == null ? null : now - a.cellularAt;
+          const tdAge = el("td", age == null ? "sb-muted" : null,
+            age == null ? "--" : fmt(age, 1, " s"));
+          if (age != null && age > STALE_REPORT_S) tdAge.className = "sb-bad";
+
+          tr.append(tdName, tdTier, tdPing, tdPath, tdSignal, tdIface, tdAge);
+          tr.addEventListener("click", () => { selected = a.name; persist(); render(); });
+          tr.style.cursor = "pointer";
+          cellBody.appendChild(tr);
+        }
         if (!agents.length) {
           const tr = el("tr");
           const td = el("td", "sb-note", "No agents configured.");
-          td.colSpan = 8;
+          td.colSpan = cellCols.length;
           tr.appendChild(td);
-          metricsBody.appendChild(tr);
+          cellBody.appendChild(tr);
         }
 
-        const backupCount = agents.filter((a) => a.tiers.backup.everSeen).length;
-        targetsNote.textContent =
-          `Targets: packet drop < ${cfg.dropTargetPct}% · RTT < ${cfg.rttTargetMs} ms. ` +
-          `Drop and RTT are derived from DDS telemetry arrival statistics over a ${METRIC_WINDOW_S}s window ` +
-          `(RTT = 2x the mean of rx-time minus header stamp, which is the true one-way delay while PTP holds). ` +
-          `The sync floor is the minimum of that offset and its slope over ${PTP_WINDOW_S}s is the PTP drift — ` +
-          `a floor that ramps means the clocks are separating, so read RTT against it. ` +
-          `Cellular failover transport: ${backupCount}/${agents.length} agents provisioned on ${cfg.backupTopicTemplate}.`;
+        cellNote.textContent = anyReport
+          ? `Reported on ${cfg.cellularTopicTemplate} (std_msgs/String, JSON). ` +
+            "\"relay\" means Tailscale could not hole-punch and is bouncing through a DERP " +
+            "server — the extra hop is the latency you are seeing."
+          : `No cellular reporter publishing yet. Have each agent publish JSON on ` +
+            `${cfg.cellularTopicTemplate} with any of: tier (\"5G\"/\"LTE\"), rtt_ms ` +
+            `(a tailscale ping to the GCS), state (\"direct\"/\"relay\"), rsrp_dbm, interface. ` +
+            "VPN ping falls back to the arrival statistics of DDS traffic on " +
+            `${cfg.vpnTopicTemplate} when no reporter is running.`;
+      }
 
-        // Transition log — newest first, across the whole swarm.
-        const events = [];
-        for (const a of agents) {
-          for (const t of a.transitions) events.push({ ...t, name: a.name });
-        }
-        events.sort((x, y) => y.t - x.t);
-        logBox.textContent = events.length
-          ? events.slice(0, 40).map((e) =>
-              `${clockStamp(e.t)}  ${e.name.padEnd(10)} ${e.from} → ${e.to}  [${e.tier}]`).join("\n")
-          : "No link state transitions recorded yet.";
-
-        // Power cards
+      function renderPower() {
         powerGrid.textContent = "";
         for (const a of agents) {
           const p = a.power ?? { state: RTB_STATE.NO_DATA };
@@ -1164,7 +1674,7 @@ function activate(extensionContext) {
           const head = el("div", "sb-agent-top");
           head.append(
             el("span", "sb-agent-name", a.name),
-            el("span", `sb-role ${a.role}`, a.role === "strike" ? "STRIKE" : "GUARD"),
+            el("span", `sb-mode ${a.mode}`, MODES[a.mode].label),
           );
           const rtbChip = el("span", "sb-chip", p.state.label);
           rtbChip.style.background = p.state.color;
@@ -1230,6 +1740,112 @@ function activate(extensionContext) {
           `"RTB NOW" additionally fires when SoC drops to the distance-to-pad energy budget ` +
           `(cruise ${cfg.cruiseSpeedMps} m/s + descent ${cfg.landSpeedMps} m/s at the measured burn rate, ` +
           `plus a ${cfg.reservePct}% reserve). Sag is measured against the highest open-circuit voltage seen this session.`;
+      }
+
+      function render() {
+        const now = nowSec();
+        for (const a of agents) {
+          evaluateLink(a, cfg, now);
+          evaluateEstimate(a, cfg, now);
+          evaluatePower(a, cfg, now);
+        }
+
+        renderSafety();
+
+        // Section visibility follows the topics actually on the wire.
+        show(cellCard, caps.cellular);
+        show(powerCard, caps.battery);
+        show(formRow, caps.formation);
+        const lanes = TIERS.filter((t) => t.id === "lan" || caps.vpnLane);
+        commSub.textContent = caps.mocap || caps.ekf
+          ? "— ping · mocap delay · EKF status · transport"
+          : "— ping · packet drop · transport";
+
+        // Banner
+        const worstLink = worst(agents.map((a) => a.linkState), LINK_STATE);
+        linkChip.textContent = `LINK ${worstLink.label}`;
+        linkChip.style.background = worstLink.color;
+
+        show(estChip, caps.ekf || caps.mocap);
+        if (caps.ekf || caps.mocap) {
+          const realAgents = agents.filter((a) => a.mode === "real");
+          const worstEst = worst(realAgents.map((a) => a.estimate?.state), EKF_STATE);
+          estChip.textContent = `EKF ${worstEst.label}`;
+          estChip.style.background = worstEst.color;
+        }
+
+        show(powerChip, caps.battery);
+        if (caps.battery) {
+          const worstPower = worst(agents.map((a) => a.power?.state), RTB_STATE);
+          powerChip.textContent = `POWER ${worstPower.label}`;
+          powerChip.style.background = worstPower.color;
+        }
+
+        const sims = agents.filter((a) => a.mode === "sim").length;
+        modeChip.textContent = `${sims} sim · ${agents.length - sims} real`;
+        const tasks = detectedTasks();
+        show(taskChip, tasks.length > 0);
+        taskChip.textContent = `Tasks: ${tasks.join(", ")}`;
+        taskChip.title = caps.discovered
+          ? "Inferred from the topics on this data source; sections with no source are hidden."
+          : "No topic list from this data source — showing every section.";
+
+        const airborne = agents.filter((a) => a.pos && a.pos[2] > 0.3).length;
+        clockEl.textContent = `${airborne}/${agents.length} airborne · ${clockStamp(now)}`;
+
+        // Roster
+        for (const a of agents) {
+          const r = rosterRows.get(a.name);
+          if (!r) continue;
+          r.row.classList.toggle("sb-selected", a.name === selected);
+          r.dot.style.background = a.linkState.color;
+          r.mode.className = `sb-mode ${a.mode}`;
+          r.mode.textContent = MODES[a.mode].label;
+          const soc = a.power?.soc;
+          r.fill.style.width = `${clamp(soc ?? 0, 0, 100)}%`;
+          r.fill.style.background = socColor(soc);
+          const ping = a.metrics?.pingMs;
+          const parts = [
+            soc == null ? "-- %" : `${soc.toFixed(0)}%`,
+            a.linkState.label,
+            ping == null ? "-- ms" : `${ping.toFixed(0)} ms`,
+          ];
+          if (a.mode === "real" && caps.ekf && a.estimate?.state) {
+            parts.push(a.estimate.state.label);
+          }
+          r.meta.textContent = parts.join(" · ");
+        }
+
+        renderWiring();
+
+        // Topology — reparsing SVG markup 5x/s is wasteful, so only redraw when
+        // the picture would actually change.
+        const topoKey = agents.map((a) =>
+          `${a.name}:${a.mode}:${a.linkState.label}:${a.activeTier}:` +
+          `${a.tiers.lan.everSeen}${a.tiers.vpn.everSeen}`).join("|")
+          + `#${lanes.length}`;
+        if (topoKey !== lastTopoKey) {
+          lastTopoKey = topoKey;
+          topoBox.innerHTML = agents.length
+            ? topologySvg(agents, lanes)
+            : '<div class="sb-note">No agents configured.</div>';
+        }
+
+        renderLinkTable(now, lanes);
+
+        // Transition log — newest first, across the whole swarm.
+        const events = [];
+        for (const a of agents) {
+          for (const t of a.transitions) events.push({ ...t, name: a.name });
+        }
+        events.sort((x, y) => y.t - x.t);
+        logBox.textContent = events.length
+          ? events.slice(0, 40).map((e) =>
+              `${clockStamp(e.t)}  ${e.name.padEnd(10)} ${e.from} → ${e.to}  [${e.tier}]`).join("\n")
+          : "No link state transitions recorded yet.";
+
+        if (caps.cellular) renderCellular(now);
+        if (caps.battery) renderPower();
 
         statusEl.textContent = statusText;
       }
@@ -1237,12 +1853,20 @@ function activate(extensionContext) {
       // ── settings ─────────────────────────────────────────────────────────
       const NUMERIC = new Set([
         "cruiseSpeedMps", "landSpeedMps", "reservePct", "rtbNominalPct",
-        "rtbGatedPct", "dropTargetPct", "rttTargetMs",
+        "rtbGatedPct", "dropTargetPct", "pingTargetMs", "vpnPingTargetMs",
+        "mocapAgeTargetMs", "mocapTimeoutS",
       ]);
       const ROSTER_KEYS = new Set([
-        "drones", "roles", "stateTopicTemplate", "primaryTopicTemplate",
-        "backupTopicTemplate", "batteryTopicTemplate", "batteryAltTopicTemplate",
-        "linkStatusTopicTemplate", "positionOffsets",
+        "drones", "modes", "stateTopicTemplate", "lanTopicTemplate",
+        "vpnTopicTemplate", "simBatteryTopicTemplate", "realBatteryTopicTemplate",
+        "mocapTopicTemplate", "ekfFlagsTopicTemplate", "localPositionTopicTemplate",
+        "timesyncTopicTemplate", "cellularTopicTemplate", "linkStatusTopicTemplate",
+        "positionOffsets",
+      ]);
+      const CAPS_KEYS = new Set([
+        "sections", "formationTopic", "teleopTopicTemplate", "goalTopicTemplate",
+        "simCommandTopicTemplate", "realCommandTopicTemplate",
+        "simRobotCommandTemplate", "realRobotCommandTemplate",
       ]);
 
       function updateSettingsEditor() {
@@ -1254,6 +1878,7 @@ function activate(extensionContext) {
             cfg[key] = NUMERIC.has(key) ? Number(action.payload.value) : String(action.payload.value ?? "");
             persist();
             if (ROSTER_KEYS.has(key)) rebuildAgents();
+            else if (CAPS_KEYS.has(key)) recomputeCaps();
             updateSettingsEditor();
             render();
           },
@@ -1262,31 +1887,69 @@ function activate(extensionContext) {
               label: "Swarm",
               fields: {
                 drones: { label: "Agents", input: "string", value: cfg.drones,
-                  help: "Comma-separated drone names, in drone_names order" },
-                roles: { label: "Roles", input: "string", value: cfg.roles,
-                  help: "Comma-separated guard|strike, one per agent" },
+                  help: "Comma-separated agent names, in drone_names order" },
+                modes: { label: "Modes (wiring)", input: "string", value: cfg.modes,
+                  help: "Comma-separated sim|real, one per agent — mirrors swarm_commander's " +
+                        "drone_modes. Blank entries are detected from the topics on the wire." },
+                sections: { label: "Sections", input: "select", value: cfg.sections,
+                  options: [
+                    { label: "Auto (hide with no topic)", value: "auto" },
+                    { label: "Show all", value: "all" },
+                  ],
+                  help: "Auto hides any section whose topics are not being published" },
                 commanderNs: { label: "Commander namespace", input: "string", value: cfg.commanderNs,
                   help: "std_srvs/Trigger lifecycle services live under this namespace" },
                 formationTopic: { label: "Formation topic", input: "string", value: cfg.formationTopic },
               },
             },
-            topics: {
-              label: "Topics",
+            simWiring: {
+              label: "Wiring — sim",
               fields: {
-                stateTopicTemplate: { label: "State", input: "string", value: cfg.stateTopicTemplate },
-                primaryTopicTemplate: { label: "Primary link (Wi-Fi mesh)", input: "string", value: cfg.primaryTopicTemplate },
-                backupTopicTemplate: { label: "Backup link (5G/4G)", input: "string", value: cfg.backupTopicTemplate },
-                batteryTopicTemplate: { label: "Battery (PX4)", input: "string", value: cfg.batteryTopicTemplate },
-                batteryAltTopicTemplate: { label: "Battery (MAVROS)", input: "string", value: cfg.batteryAltTopicTemplate },
-                linkStatusTopicTemplate: { label: "Link report (optional)", input: "string", value: cfg.linkStatusTopicTemplate,
-                  help: "std_msgs/String JSON; drop_rate / rtt_ms / ptp_offset_ms / ptp_drift_ms / active_tier override the derived values" },
+                simCommandTopicTemplate: { label: "Velocity command", input: "string", value: cfg.simCommandTopicTemplate },
+                simRobotCommandTemplate: { label: "Robot command", input: "string", value: cfg.simRobotCommandTemplate },
+                simBatteryTopicTemplate: { label: "Battery (MAVROS)", input: "string", value: cfg.simBatteryTopicTemplate },
               },
             },
-            comms: {
-              label: "CommLink targets",
+            realWiring: {
+              label: "Wiring — real",
               fields: {
+                realCommandTopicTemplate: { label: "Velocity command", input: "string", value: cfg.realCommandTopicTemplate },
+                realRobotCommandTemplate: { label: "Robot command", input: "string", value: cfg.realRobotCommandTemplate },
+                realBatteryTopicTemplate: { label: "Battery (PX4)", input: "string", value: cfg.realBatteryTopicTemplate },
+                mocapTopicTemplate: { label: "Mocap pose", input: "string", value: cfg.mocapTopicTemplate,
+                  help: "geometry_msgs/PoseStamped — mocap_bridge's input; its age is the state-estimate delay" },
+                ekfFlagsTopicTemplate: { label: "EKF flags", input: "string", value: cfg.ekfFlagsTopicTemplate,
+                  help: "px4_msgs/EstimatorStatusFlags — cs_ev_* tells you EKF2 is fusing mocap" },
+                localPositionTopicTemplate: { label: "Local position", input: "string", value: cfg.localPositionTopicTemplate,
+                  help: "px4_msgs/VehicleLocalPosition — xy_valid / z_valid / heading_good_for_control" },
+                timesyncTopicTemplate: { label: "Timesync (ping)", input: "string", value: cfg.timesyncTopicTemplate,
+                  help: "px4_msgs/TimesyncStatus — round_trip_time is a measured link RTT" },
+              },
+            },
+            transports: {
+              label: "Transports",
+              fields: {
+                stateTopicTemplate: { label: "State", input: "string", value: cfg.stateTopicTemplate },
+                lanTopicTemplate: { label: "Wi-Fi / LAN path", input: "string", value: cfg.lanTopicTemplate,
+                  help: "A stamped message carried on the local network path" },
+                vpnTopicTemplate: { label: "4G/5G VPN path", input: "string", value: cfg.vpnTopicTemplate,
+                  help: "A stamped message carried over the Tailscale VPN path" },
+                cellularTopicTemplate: { label: "Cellular report", input: "string", value: cfg.cellularTopicTemplate,
+                  help: "std_msgs/String JSON: tier, rtt_ms, state (direct|relay), rsrp_dbm, interface" },
+                linkStatusTopicTemplate: { label: "Link report (optional)", input: "string", value: cfg.linkStatusTopicTemplate,
+                  help: "std_msgs/String JSON; drop_rate / rtt_ms / clock_offset_ms / clock_drift_ms / active_tier override the derived values" },
+                teleopTopicTemplate: { label: "Teleop (detect only)", input: "string", value: cfg.teleopTopicTemplate },
+                goalTopicTemplate: { label: "Goal (detect only)", input: "string", value: cfg.goalTopicTemplate },
+              },
+            },
+            linkSafety: {
+              label: "Link safety targets",
+              fields: {
+                pingTargetMs: { label: "Ping target, LAN (ms)", input: "number", value: cfg.pingTargetMs, step: 1 },
+                vpnPingTargetMs: { label: "Ping target, VPN (ms)", input: "number", value: cfg.vpnPingTargetMs, step: 5 },
                 dropTargetPct: { label: "Packet drop target (%)", input: "number", value: cfg.dropTargetPct, step: 0.1 },
-                rttTargetMs: { label: "RTT target (ms)", input: "number", value: cfg.rttTargetMs, step: 1 },
+                mocapAgeTargetMs: { label: "Mocap age target (ms)", input: "number", value: cfg.mocapAgeTargetMs, step: 5 },
+                mocapTimeoutS: { label: "Mocap loss timeout (s)", input: "number", value: cfg.mocapTimeoutS, step: 0.1 },
               },
             },
             power: {
