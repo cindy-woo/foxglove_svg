@@ -72,8 +72,8 @@ swarm_commander:
     cbf_alpha: 2.5
 
     fence_enabled: true
-    fence_min: [-4.0, -2.0, 0.0]
-    fence_max: [4.0, 2.0, 3.0]
+    fence_min: [-4.0, -4.0, 0.0]
+    fence_max: [4.0, 4.0, 3.0]
 
 # Launch with use_mocap:=true so the REAL holders' PX4 EKFs get mocap as
 # external vision (direct mode: /{name}/pose -> /{name}/fmu/in/vehicle_visual_odometry,

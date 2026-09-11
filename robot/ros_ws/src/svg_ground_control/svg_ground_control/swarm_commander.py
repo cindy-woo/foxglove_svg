@@ -668,8 +668,10 @@ class SwarmCommander(Node):
             except Exception as e:  # noqa: BLE001 - log any service failure
                 self.get_logger().error(f'{name}: {label} failed: {e}')
                 return
-            level = self.get_logger().info if ok else self.get_logger().error
-            level(f'{name}: {label} -> success={ok}')
+            if ok:
+                self.get_logger().info(f'{name}: {label} -> success={ok}')
+            else:
+                self.get_logger().error(f'{name}: {label} -> success={ok}')
 
         future.add_done_callback(report)
 

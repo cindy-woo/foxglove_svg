@@ -125,19 +125,37 @@
           "value": "/drone_1/fmu/out/battery_status.remaining",
           "enabled": true,
           "timestampMethod": "receiveTime",
-          "label": "drone_1 SoC"
+          "label": "drone_1 SoC (real)"
+        },
+        {
+          "value": "/drone_1/interface/mavros/battery.percentage",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "drone_1 SoC (sim)"
         },
         {
           "value": "/drone_2/fmu/out/battery_status.remaining",
           "enabled": true,
           "timestampMethod": "receiveTime",
-          "label": "drone_2 SoC"
+          "label": "drone_2 SoC (real)"
+        },
+        {
+          "value": "/drone_2/interface/mavros/battery.percentage",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "drone_2 SoC (sim)"
         },
         {
           "value": "/drone_3/fmu/out/battery_status.remaining",
           "enabled": true,
           "timestampMethod": "receiveTime",
-          "label": "drone_3 SoC"
+          "label": "drone_3 SoC (real)"
+        },
+        {
+          "value": "/drone_3/interface/mavros/battery.percentage",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "drone_3 SoC (sim)"
         }
       ],
       "showXAxisLabels": true,
@@ -157,19 +175,37 @@
           "value": "/drone_1/fmu/out/battery_status.voltage_filtered_v",
           "enabled": true,
           "timestampMethod": "receiveTime",
-          "label": "drone_1 V"
+          "label": "drone_1 V (real)"
+        },
+        {
+          "value": "/drone_1/interface/mavros/battery.voltage",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "drone_1 V (sim)"
         },
         {
           "value": "/drone_2/fmu/out/battery_status.voltage_filtered_v",
           "enabled": true,
           "timestampMethod": "receiveTime",
-          "label": "drone_2 V"
+          "label": "drone_2 V (real)"
+        },
+        {
+          "value": "/drone_2/interface/mavros/battery.voltage",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "drone_2 V (sim)"
         },
         {
           "value": "/drone_3/fmu/out/battery_status.voltage_filtered_v",
           "enabled": true,
           "timestampMethod": "receiveTime",
-          "label": "drone_3 V"
+          "label": "drone_3 V (real)"
+        },
+        {
+          "value": "/drone_3/interface/mavros/battery.voltage",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "drone_3 V (sim)"
         }
       ],
       "showXAxisLabels": true,
